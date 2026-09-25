@@ -1,0 +1,33 @@
+# Default configuration for reflecto.
+#
+# To override selected values, run `reflecto config init` to copy
+# this file to ./reflecto.toml, then edit only the keys you need
+# to change -- everything else falls back to these defaults.
+
+[stages]
+device_uri_large = 'xi-com:\\.\COM3'
+device_uri_small = 'xi-com:\\.\COM4'
+zero_l = 180.5      # degrees, zero for large rotation stage wrt home
+zero_s = -40         # degrees, zero for small rotation stage wrt home
+res_large = 0.0072   # degrees per microstep, large stage
+res_small = 0.015    # degrees per microstep, small stage
+angle_min = 30       # degrees, soft limit
+angle_max = 180.0    # degrees, soft limit
+
+[toptica]
+host = "192.0.2.1"  # placeholder -- override in reflecto.toml with the real instrument address
+port = 1998
+freq_step = 0.05
+settle_freq_tol = 0.1
+settle_timeout = 10.0
+amp_tol = 0.0005
+offset_tol = 0.0002
+gain_default = 330000
+stabilize_tol = 0.01
+stabilize_hold = 2.0
+stabilize_timeout = 30.0
+
+[scan_defaults]
+freq_start = 70
+freq_stop = 400
+int_time = 3
