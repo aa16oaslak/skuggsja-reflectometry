@@ -83,10 +83,11 @@ def run_with_emergency_stop(
     *sweep_args,
     gui: bool = True,
     title: str = "Sweep running",
+    window: Waiter | None = None,
 ) -> None:
     """Runs sweep_fn(*sweep_args, stop_event) on a worker thread while the
-    main thread shows the STOP window (or, with gui=False, just waits, with
-    Ctrl+C as the stop).
+    main thread shows the STOP window -- or `window`, if given -- or, with
+    gui=False, just waits, with Ctrl+C as the stop.
 
     However the sweep ends -- normally, by a stop, or by an unexpected
     exception -- the stages are halted if needed and then closed.
@@ -106,7 +107,7 @@ def run_with_emergency_stop(
             if not isinstance(e, RuntimeError):
                 failure.append(e)
 
-    waiter: Waiter = run_stop_window if gui else wait_in_console
+    waiter: Waiter = (window or run_stop_window) if gui else wait_in_console
     worker = threading.Thread(target=work, name="sweep", daemon=True)
     restore_ctrl_c = _route_ctrl_c_to(estop)
     try:

@@ -1,3 +1,4 @@
+import socket
 import sys
 
 import pytest
@@ -199,3 +200,49 @@ def test_spec_reports_missing_display_cleanly(tmp_path, monkeypatch):
     assert result.exit_code == 1
     assert "Could not open the stop window" in result.output
     assert isinstance(result.exception, SystemExit)
+
+
+SIM_ARGS = [
+    "spec", "--start-angle", "15", "--end-angle", "22.5", "--step", "7.5",
+    "--freq-start", "70", "--freq-stop", "70.5", "--filename", "run",
+]
+
+
+def test_simulate_runs_a_whole_sweep_without_touching_hardware(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "open_stages", lambda stage_cfg: pytest.fail("opened the real stages"))
+    real_connect = socket.socket.connect
+
+    def localhost_only(sock, address):
+        assert address[0] == "127.0.0.1", f"connected to {address}"
+        return real_connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", localhost_only)
+
+    result = runner.invoke(cli.app, [*SIM_ARGS, "--simulate", "--no-gui", "--speed", "1000"])
+
+    assert result.exit_code == 0, result.output
+    assert "no hardware was used" in result.output
+    assert sorted(p.name for p in (tmp_path / "reflecto_simulated").iterdir()) == [
+        "run_15.0degrees_3ms_70.0GHz_to_70.5.txt",
+        "run_22.5degrees_3ms_70.0GHz_to_70.5.txt",
+    ]
+    assert not list(tmp_path.glob("*.txt"))  # nothing where real data goes
+
+
+def test_speed_needs_simulate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.app, [*SIM_ARGS, "--speed", "5"])
+    assert result.exit_code == 1
+    assert "--speed needs --simulate" in result.output
+
+
+def test_simulate_reports_a_collision_the_real_sweep_would_hit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "run_15.0degrees_3ms_70.0GHz_to_70.5.txt").write_text("real data\n")
+
+    result = runner.invoke(cli.app, [*SIM_ARGS, "--simulate", "--no-gui"])
+
+    assert result.exit_code == 1
+    assert "real sweep would stop here too" in result.output
+    assert (tmp_path / "run_15.0degrees_3ms_70.0GHz_to_70.5.txt").read_text() == "real data\n"

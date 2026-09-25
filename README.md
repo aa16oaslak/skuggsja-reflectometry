@@ -9,45 +9,45 @@ either specular (theta-2theta) or non-specular (receiver-only).
 
 ## Install
 
-Requires Python 3.10 or newer, git and, on the control PC, Standa's
-`libximc` vendor driver installed separately (the Python package alone does
-not include it).
+Requires [Miniconda](https://docs.anaconda.com/miniconda/) (or Anaconda),
+git and, on the control PC, Standa's `libximc` vendor driver installed
+separately (the Python package alone does not include it).
 
-Clone the repository and install it into a virtual environment inside the
-clone:
+Open the **Anaconda Prompt** from the Start menu, create a conda environment
+for the setup, then clone the repository and install it into that
+environment:
 
 ```powershell
-git clone https://github.com/ashaliasrun/rannis_nyskopunarsjodur2026
-cd rannis_nyskopunarsjodur2026
-python -m venv .venv
-.venv\Scripts\activate
+conda create -n reflecto -c conda-forge python=3.12 pip
+conda activate reflecto
+git clone https://github.com/aa16oaslak/skuggsja-reflectometry
+cd skuggsja-reflectometry
 pip install -e .
 ```
 
-(If `python` is not found, use `py` instead.)
+(No git on the machine? Run `conda install -c conda-forge git` after
+`conda activate reflecto`.)
 
-This installs the `reflecto` command into the virtual environment. The `-e`
-(editable) flag means the installed program *is* this folder: after you
-edit a file or `git pull`, the next `reflecto` run uses the new code without
-reinstalling.
+This installs the `reflecto` command into the `reflecto` environment. Using
+pip inside a conda environment is the normal way to install a package from
+its source folder. The `-e` (editable) flag means the installed program *is*
+the cloned folder: after you edit a file or `git pull`, the next `reflecto`
+run uses the new code without reinstalling.
 
-Each time you open a new terminal, activate the environment before using
-`reflecto`:
+Each time you open a new Anaconda Prompt, activate the environment before
+using `reflecto`:
 
 ```powershell
-C:\path\to\rannis_nyskopunarsjodur2026\.venv\Scripts\activate
+conda activate reflecto
 ```
-
-If PowerShell refuses with "running scripts is disabled on this system",
-run the same command in Command Prompt (`cmd`) instead, or allow it once for
-your user with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 
 To update, pull and reinstall from the clone with the environment active
 (the reinstall only matters if the dependencies in `pyproject.toml`
 changed, but it is quick and harmless):
 
 ```powershell
-cd C:\path\to\rannis_nyskopunarsjodur2026
+conda activate reflecto
+cd C:\path\to\skuggsja-reflectometry
 git pull
 pip install -e .
 ```
@@ -92,6 +92,39 @@ e.g. when running over a remote shell without a display.
 
 An unexpected error during the sweep also halts both stages before the
 error is reported.
+
+## Test a sweep without hardware
+
+Add `--simulate` to any sweep command to rehearse it on any computer, with
+nothing connected:
+
+```powershell
+reflecto spec --start-angle 15 --end-angle 45 --step 7.5 --filename 270826_specular_ref --simulate
+```
+
+The same sweep code runs, but against simulated rotation stages and a
+simulated TOptica on your own computer, so no hardware is opened or moved.
+The stages are calibrated and limited from your config exactly like the real
+ones, and the simulation is plainly labelled everywhere it shows up.
+
+- A live window draws the setup from above, like Fig. 1 of
+  [arXiv:2407.05512](https://arxiv.org/abs/2407.05512): the transmitter,
+  the receiver moving on its ring (with its allowed range), the sample and
+  its normal, the angles φ1 (incidence) and φ2 (receiver, from the normal),
+  and the planned receiver positions. Next to it: both stage angles against
+  the plan, scan progress, the output file, and warnings, e.g. when a stage
+  is outside its soft limits. The STOP button works as in a real sweep.
+- Time runs 20x faster by default (`--speed` to change it). Settle times,
+  stage travel and the printed estimates stay in real-world seconds.
+- Output files (with a made-up photocurrent) go to `reflecto_simulated/`,
+  never next to your real data. If a real file would be overwritten, the
+  simulation stops with the same error the real sweep would give.
+- Afterwards, a summary lists planned vs. actual angles for every step, any
+  move stopped by a soft limit, and the estimated time on the setup.
+
+Stage speeds are guesses (the real ones are stored in the stage
+controllers), so the time estimate is approximate. `--simulate --no-gui`
+skips the window and just prints the summary.
 
 ## Notes
 

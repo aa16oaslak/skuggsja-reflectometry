@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from .config import AppConfig
 from .stages import home_and_zero, position, rotate_relative, rotate_to_angle
@@ -12,6 +12,40 @@ if TYPE_CHECKING:
     import libximc.highlevel as ximc
 
 STAGE_NAMES = ("8MRB450", "8MR174")
+NONSPEC_SAMPLE_ANGLE = 15  # degrees; where the sample sits during a non-specular sweep
+
+
+class PlannedStep(NamedTuple):
+    """One angle of a sweep: where both stages should be for its scan."""
+
+    sample: float
+    receiver: float
+    file_angle: float  # the angle in this step's output filename
+
+    def output_file(self, filename: str, int_time: float, freq_start: float, freq_stop: float) -> str:
+        return build_output_filename(f"{filename}_{self.file_angle}degrees", int_time, freq_start, freq_stop)
+
+
+def plan_spec(start: float, end: float, step: float) -> list[PlannedStep]:
+    """The steps a specular sweep scans at, in order (same arithmetic as
+    sweep_spec)."""
+    amount = int((end - start) / step)
+    steps = []
+    for i in range(amount + 1):
+        n = start + i * step
+        steps.append(PlannedStep(n, 2 * start + i * (2 * step), n))
+    return steps
+
+
+def plan_nonspec(start: float, end: float, step: float) -> list[PlannedStep]:
+    """The steps a non-specular sweep scans at, in order (same arithmetic
+    as sweep_nonspec)."""
+    amount = int((end - start) / step)
+    steps = []
+    for i in range(amount + 1):
+        n = start + i * step
+        steps.append(PlannedStep(NONSPEC_SAMPLE_ANGLE, n, n))
+    return steps
 
 
 def _check_outputs_available(
@@ -84,11 +118,11 @@ def sweep_nonspec(
         )
     else:
         print("Rotating receiver to 30°")
-        print("Rotating sample to 15°")
+        print(f"Rotating sample to {NONSPEC_SAMPLE_ANGLE}°")
         rotate_to_angle(large_stage, 30, True, stop_event, zero_l, zero_s, angle_min, angle_max)
         if stop_event.is_set():
             return
-        rotate_to_angle(small_stage, 15, False, stop_event, zero_l, zero_s, angle_min, angle_max)
+        rotate_to_angle(small_stage, NONSPEC_SAMPLE_ANGLE, False, stop_event, zero_l, zero_s, angle_min, angle_max)
         if stop_event.is_set():
             return
         print(f"Rotated receiver to {position(large_stage, True, zero_l, zero_s)}°")

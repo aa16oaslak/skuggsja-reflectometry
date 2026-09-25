@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .emergency_stop import EmergencyStop
 
-_POLL_MS = 100
 _RED, _DARK_RED, _GREY = "#c62828", "#8e0000", "#616161"
 
 
@@ -24,7 +23,13 @@ class StopWindow:
     button, Esc while the window is focused, closing the window) only calls
     estop.trigger(), which returns immediately, so the window stays
     responsive even while the sweep thread is blocked in a stage or TOptica
-    call. Tk requires this to be created and run on the main thread."""
+    call. Tk requires this to be created and run on the main thread.
+
+    Subclasses can add widgets to the left of `self.controls`, or into it
+    before `self.button`, and extend _refresh(), which runs every poll_ms."""
+
+    poll_ms = 100
+    window_title = "reflecto - emergency stop"
 
     def __init__(self, estop: EmergencyStop, title: str) -> None:
         try:
@@ -43,19 +48,23 @@ class StopWindow:
                 f"Original error: {exc}"
             ) from exc
 
+        self.tk = tk
         self._estop = estop
         self._title = title
         self._t0 = time.monotonic()
 
-        self.root.title("reflecto - emergency stop")
+        self.root.title(self.window_title)
         self.root.attributes("-topmost", True)
         self.root.resizable(False, False)
 
-        self.status = tk.Label(self.root, text=title, font=("Helvetica", 12), wraplength=400, justify="center")
+        self.controls = tk.Frame(self.root)
+        self.controls.pack(side="right", fill="both", expand=True)
+
+        self.status = tk.Label(self.controls, text=title, font=("Helvetica", 12), wraplength=400, justify="center")
         self.status.pack(padx=16, pady=(14, 6))
 
         self.button = tk.Button(
-            self.root,
+            self.controls,
             text="STOP",
             font=("Helvetica", 40, "bold"),
             bg=_RED,
@@ -71,7 +80,7 @@ class StopWindow:
         self.button.pack(fill="both", expand=True, padx=16, pady=6, ipady=18)
 
         tk.Label(
-            self.root,
+            self.controls,
             text="Esc also stops while this window is focused.\nClosing this window stops the sweep.",
             font=("Helvetica", 9),
         ).pack(padx=16, pady=(6, 14))
@@ -101,7 +110,7 @@ class StopWindow:
             self.root.destroy()
             return
         self._refresh()
-        self.root.after(_POLL_MS, self._poll)
+        self.root.after(self.poll_ms, self._poll)
 
     def run(self, worker: threading.Thread) -> None:
         """Starts `worker` once the window is on screen, and blocks until
@@ -109,7 +118,7 @@ class StopWindow:
         self._worker = worker
         self.root.update()  # draw the button before anything can move
         worker.start()
-        self.root.after(_POLL_MS, self._poll)
+        self.root.after(self.poll_ms, self._poll)
         self.root.mainloop()
 
 

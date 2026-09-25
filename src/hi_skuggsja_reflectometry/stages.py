@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import threading
-import time
 from typing import TYPE_CHECKING
 
+from . import clock
 from .config import StageConfig
 
 if TYPE_CHECKING:
     import libximc.highlevel as ximc
+
+
+# libximc flag values, spelled out so that moving and limit-setting work
+# without loading the native library (the simulated stages need neither).
+# libximc accepts plain ints for these and reports status as int flags.
+MVCMD_ERROR = 0x40  # MvcmdStatus.MVCMD_ERROR
+MVCMD_RUNNING = 0x80  # MvcmdStatus.MVCMD_RUNNING
+BORDER_IS_ENCODER = 0x01  # borders are the LeftBorder/RightBorder positions, not limit switches
+BORDER_STOP_LEFT = 0x02
+BORDER_STOP_RIGHT = 0x04
 
 
 class HardwareUnavailable(RuntimeError):
@@ -52,12 +62,11 @@ def set_speed_accel(axis: ximc.Axis, speed: float, accel: float) -> None:
 def wait_for_stop(axis: ximc.Axis, stop_event: threading.Event, poll_ms: int = 100) -> None:
     """Polls the axis status while checking stop_event, instead of blocking
     on command_wait_for_stop()."""
-    MvcmdStatus = _load_ximc().MvcmdStatus
     while not stop_event.is_set():
         status = axis.get_status()
-        if not (MvcmdStatus.MVCMD_RUNNING in status.MvCmdSts):
+        if not int(status.MvCmdSts) & MVCMD_RUNNING:
             break
-        time.sleep(poll_ms / 1000)
+        clock.sleep(poll_ms / 1000)
 
     if stop_event.is_set():
         axis.command_stop()
@@ -231,12 +240,11 @@ def home_and_zero(
 
 
 def set_boundaries(axis: ximc.Axis, res: float, angle_min: float, angle_max: float, zero_l: float) -> None:
-    ximc = _load_ximc()
     edges = axis.get_edges_settings()
     existing_ender_flags = edges.EnderFlags
     edges.LeftBorder = degrees_to_microsteps(res, zero_l - angle_max)  # maximum angle
     edges.RightBorder = degrees_to_microsteps(res, zero_l - angle_min)  # minimum angle
-    edges.BorderFlags = ximc.BorderFlags(0x07)  # BORDER_IS_ALIVE | BORDER_STOP_LEFT | BORDER_STOP_RIGHT
+    edges.BorderFlags = BORDER_IS_ENCODER | BORDER_STOP_LEFT | BORDER_STOP_RIGHT
     edges.EnderFlags = existing_ender_flags  # keep existing SW1+SW2 config
     axis.set_edges_settings(edges)
 
@@ -263,11 +271,15 @@ def open_stages(cfg: StageConfig) -> tuple[ximc.Axis, ximc.Axis]:
 
     large_stage = _open_axis(ximc, cfg.device_uri_large, "large (receiver)")
     small_stage = _open_axis(ximc, cfg.device_uri_small, "small (sample)")
+    configure_stages(large_stage, small_stage, cfg)
+    return large_stage, small_stage
 
+
+def configure_stages(large_stage: ximc.Axis, small_stage: ximc.Axis, cfg: StageConfig) -> None:
+    """Calibrates both stages to degrees and applies the large stage's soft
+    angle limits -- the same for real and simulated stages."""
     large_stage.set_calb(cfg.res_large, large_stage.get_engine_settings().MicrostepMode)
     small_stage.set_calb(cfg.res_small, small_stage.get_engine_settings().MicrostepMode)
 
     set_boundaries(large_stage, cfg.res_large, cfg.angle_min, cfg.angle_max, cfg.zero_l)
     print(f"Limits {cfg.angle_min}° to {cfg.angle_max}° set successfully")
-
-    return large_stage, small_stage

@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import socket
 import threading
-import time
 from pathlib import Path
 
 import numpy as np
 
+from . import clock
 from .config import TopticaConfig
 
 
 def build_output_filename(filename: str, int_time: float, start_freq: float, stop_freq: float) -> str:
     return f"{filename}_{int_time}ms_{start_freq}GHz_to_{stop_freq}.txt"
+
+
+def frequency_grid(start_freq: float, stop_freq: float, freq_step: float) -> np.ndarray:
+    """The frequencies a scan steps through, in GHz."""
+    return np.arange(start_freq, stop_freq + freq_step, freq_step)
 
 
 def read_until_prompt(sock: socket.socket) -> str:
@@ -93,7 +98,7 @@ def scan(
         return
 
     # -- Build frequency list ---------------------------------------------------
-    frequencies = np.arange(FREQ_START, FREQ_STOP + FREQ_STEP, FREQ_STEP)
+    frequencies = frequency_grid(FREQ_START, FREQ_STOP, FREQ_STEP)
     print(f"Scan: {FREQ_START} to {FREQ_STOP} GHz in {FREQ_STEP} GHz steps = {len(frequencies)} points")
 
     # -- Storage ------------------------------------------------------------------
@@ -109,7 +114,7 @@ def scan(
     STABILIZE_HOLD = cfg.stabilize_hold
     STABILIZE_TIMEOUT = cfg.stabilize_timeout
 
-    t_start = time.time()
+    t_start = clock.time()
     stable_since = None
 
     while True:
@@ -123,14 +128,14 @@ def scan(
 
         if within_tol:
             if stable_since is None:
-                stable_since = time.time()
-            elif time.time() - stable_since >= STABILIZE_HOLD:
+                stable_since = clock.time()
+            elif clock.time() - stable_since >= STABILIZE_HOLD:
                 print(f"  Frequency stable at {freq_act:.3f} GHz")
                 break
         else:
             stable_since = None
 
-        if time.time() - t_start > STABILIZE_TIMEOUT:
+        if clock.time() - t_start > STABILIZE_TIMEOUT:
             print(
                 f"  Warning: frequency did not fully stabilize "
                 f"(actual: {freq_act:.3f} GHz, target: {FREQ_START} GHz)"
@@ -138,10 +143,10 @@ def scan(
             break
 
         print(f"  Waiting... current frequency: {freq_act:.3f} GHz")
-        time.sleep(0.2)
+        clock.sleep(0.2)
 
     print("Proceeding with scan.\n")
-    scan_start_time = time.time()
+    scan_start_time = clock.time()
 
     # -- Scan loop ------------------------------------------------------------------
     for i, freq in enumerate(frequencies):
@@ -153,7 +158,7 @@ def scan(
         send_command(s, f"(param-set! 'frequency:frequency-set {freq})")
 
         # 2. Wait for frequency to settle
-        t_start = time.time()
+        t_start = clock.time()
         while True:
             if stop_event.is_set():  # check while waiting to settle
                 print("🛑 Emergency stop during frequency settle")
@@ -161,13 +166,13 @@ def scan(
             freq_act = get_float(s, "frequency:frequency-act")
             if abs(freq_act - freq) < SETTLE_FREQ_TOL:
                 break
-            if time.time() - t_start > SETTLE_TIMEOUT:
+            if clock.time() - t_start > SETTLE_TIMEOUT:
                 print(
                     f"  Warning: frequency did not settle at {freq} GHz "
                     f"(actual: {freq_act:.2f} GHz)"
                 )
                 break
-            time.sleep(0.1)
+            clock.sleep(0.1)
 
         if stop_event.is_set():  # check after settle loop
             break
@@ -182,7 +187,7 @@ def scan(
             if stop_event.is_set():
                 print("🛑 Emergency stop during integration")
                 break
-            time.sleep(0.05)
+            clock.sleep(0.05)
             elapsed += 0.05
 
         if stop_event.is_set():  # check after integration sleep
@@ -204,7 +209,7 @@ def scan(
             while elapsed < integration_s:
                 if stop_event.is_set():  # check during retry integration
                     break
-                time.sleep(0.05)
+                clock.sleep(0.05)
                 elapsed += 0.05
 
             if stop_event.is_set():
@@ -225,7 +230,7 @@ def scan(
 
         # Progress update every 30 points
         if i % 30 == 0:
-            elapsed_total = time.time() - scan_start_time
+            elapsed_total = clock.time() - scan_start_time
             remaining = (elapsed_total / (i + 1)) * (len(frequencies) - i - 1)
             print(
                 f"  [{i + 1}/{len(frequencies)}] {freq:.1f} GHz → "
@@ -241,7 +246,7 @@ def scan(
         else:
             print(
                 f"\nScan complete! {len(results_freq_set)} points in "
-                f"{time.time() - scan_start_time:.1f}s"
+                f"{clock.time() - scan_start_time:.1f}s"
             )
 
         data = np.column_stack(
