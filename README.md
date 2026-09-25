@@ -115,3 +115,12 @@ From the clone, with the environment active:
 pip install -e ".[dev]"
 pytest
 ```
+
+## Credits
+
+Originally written by Ashali Asrun
+([ashaliasrun/rannis_nyskopunarsjodur2026](https://github.com/ashaliasrun/rannis_nyskopunarsjodur2026))
+in a project funded by the RANNÍS Student Innovation Fund 2026 at the
+University of Iceland. This repository continues that work, and the
+original commit history is preserved.
+
