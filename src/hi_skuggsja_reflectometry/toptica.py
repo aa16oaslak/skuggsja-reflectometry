@@ -8,6 +8,11 @@ import numpy as np
 
 from . import clock
 from .config import TopticaConfig
+from .monitoring import LinkMonitor, ScanProgress
+
+# Live status for the GUI, written as scan() talks to the instrument.
+link = LinkMonitor()
+progress = ScanProgress()
 
 
 def build_output_filename(filename: str, int_time: float, start_freq: float, stop_freq: float) -> str:
@@ -23,6 +28,8 @@ def read_until_prompt(sock: socket.socket) -> str:
     response = b""
     while True:
         chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("The TOptica closed the connection.")
         response += chunk
         if response.endswith(b"> "):
             break
@@ -30,14 +37,35 @@ def read_until_prompt(sock: socket.socket) -> str:
 
 
 def send_command(sock: socket.socket, cmd: str) -> str:
-    sock.sendall((cmd + "\n").encode())
-    return read_until_prompt(sock)
+    try:
+        sock.sendall((cmd + "\n").encode())
+        reply = read_until_prompt(sock)
+    except OSError as e:  # includes a closed connection and timeouts
+        link.failed(e)
+        raise
+    link.ok()
+    return reply
 
 
 def get_float(sock: socket.socket, param: str) -> float:
     """Read a parameter and return it as a float."""
     response = send_command(sock, f"(param-ref '{param})")
     return float(response.split("\n")[0])
+
+
+def lockin_problems(
+    amp: float, amp_default: float, offset: float, offset_default: float, gain: float, cfg: TopticaConfig
+) -> list[str]:
+    """What is wrong with the lock-in settings for a scan; empty if nothing.
+    A scan refuses to start on any of these."""
+    problems = []
+    if not abs(amp - amp_default) < cfg.amp_tol:
+        problems.append(f"lockin:mod_out_amplitude is {amp:g}, not its default {amp_default:g}.")
+    if not abs(offset - offset_default) < cfg.offset_tol:
+        problems.append(f"lockin:mod_out_offset is {offset:g}, not its default {offset_default:g}.")
+    if gain != cfg.gain_default:
+        problems.append(f"lockin:amplifier_gain is {gain:g}, not {cfg.gain_default:g}.")
+    return problems
 
 
 def scan(
@@ -49,6 +77,21 @@ def scan(
     cfg: TopticaConfig,
     overwrite: bool = False,
 ) -> None:
+    try:
+        _scan(start_freq, stop_freq, int_time, filename, stop_event, cfg, overwrite)
+    finally:
+        progress.end()
+
+
+def _scan(
+    start_freq: float,
+    stop_freq: float,
+    int_time: float,
+    filename: str,
+    stop_event: threading.Event,
+    cfg: TopticaConfig,
+    overwrite: bool,
+) -> None:
     output_path = build_output_filename(filename, int_time, start_freq, stop_freq)
     if not overwrite and Path(output_path).exists():
         raise FileExistsError(
@@ -56,7 +99,12 @@ def scan(
         )
 
     s = socket.socket()
-    s.connect((cfg.host, cfg.port))
+    try:
+        s.connect((cfg.host, cfg.port))
+    except OSError as e:
+        link.failed(e)
+        raise
+    link.ok()
 
     # -- Connect and authenticate --------------------------------------------
     read_until_prompt(s)
@@ -71,20 +119,14 @@ def scan(
     SETTLE_TIMEOUT = cfg.settle_timeout
     AMP = get_float(s, "lockin:mod-out-amplitude")
     AMP_DEF = get_float(s, "lockin:mod-out-amplitude-default")
-    AMP_TOL = cfg.amp_tol
     OFFSET = get_float(s, "lockin:mod-out-offset")
     OFFSET_DEF = get_float(s, "lockin:mod-out-offset-default")
-    OFFSET_TOL = cfg.offset_tol
     GAIN = get_float(s, "lockin:amplifier-gain")
-    GAIN_DEF = cfg.gain_default
 
     # -- Apply settings ---------------------------------------------------------
-    if not np.abs(float(AMP) - float(AMP_DEF)) < AMP_TOL:
-        raise ValueError("lockin:mod_out_amplitude incorrect.")
-    if not np.abs(OFFSET - OFFSET_DEF) < OFFSET_TOL:
-        raise ValueError("lockin:mod_out_offset incorrect.")
-    if not GAIN == GAIN_DEF:
-        raise ValueError("lockin:amplifier_gain incorrect.")
+    problems = lockin_problems(AMP, AMP_DEF, OFFSET, OFFSET_DEF, GAIN, cfg)
+    if problems:
+        raise ValueError(" ".join(problems))
     print(f"lockin:mod_out_amplitude: {AMP}")
     print(f"lockin:mod_out_offset: {OFFSET}")
     print(f"lockin:amplifier_gain: {GAIN}")
@@ -100,6 +142,7 @@ def scan(
     # -- Build frequency list ---------------------------------------------------
     frequencies = frequency_grid(FREQ_START, FREQ_STOP, FREQ_STEP)
     print(f"Scan: {FREQ_START} to {FREQ_STOP} GHz in {FREQ_STEP} GHz steps = {len(frequencies)} points")
+    progress.begin(len(frequencies))
 
     # -- Storage ------------------------------------------------------------------
     results_freq_set = []
@@ -156,6 +199,7 @@ def scan(
 
         # 1. Set frequency
         send_command(s, f"(param-set! 'frequency:frequency-set {freq})")
+        progress.at(freq)
 
         # 2. Wait for frequency to settle
         t_start = clock.time()
@@ -227,6 +271,7 @@ def scan(
         results_freq_set.append(freq)
         results_freq_act.append(freq_act)
         results_photocurrent.append(photocurrent)
+        progress.measured()
 
         # Progress update every 30 points
         if i % 30 == 0:

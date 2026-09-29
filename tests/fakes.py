@@ -25,7 +25,7 @@ class FakeAxis:
         )
         self.move_settings = SimpleNamespace(Speed=0, Accel=0)
         self.engine_settings = SimpleNamespace(MicrostepMode=9)
-        self.calibration = None
+        self.calibration = (1.0, 9)  # (degrees per step, microstep mode) until set_calb()
 
     def get_position_calb(self):
         return SimpleNamespace(Position=self.position)
@@ -39,7 +39,8 @@ class FakeAxis:
         self.position += delta
 
     def get_status(self):
-        return SimpleNamespace(MvCmdSts=ximc.MvcmdStatus(0))  # always "stopped"
+        # always "stopped"; homed (0x20) with a 24 V motor supply
+        return SimpleNamespace(MvCmdSts=ximc.MvcmdStatus(0), Flags=0x20, Upwr=2400)
 
     def command_stop(self):
         self.calls.append(("stop",))
@@ -61,6 +62,9 @@ class FakeAxis:
 
     def set_calb(self, res, microstep_mode):
         self.calibration = (res, microstep_mode)
+
+    def get_calb(self):
+        return self.calibration
 
     def command_homezero(self):
         self.calls.append(("homezero",))

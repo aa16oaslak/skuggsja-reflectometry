@@ -11,6 +11,17 @@ from tests.fakes import FakeAxis
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def hardware_ok(monkeypatch):
+    """The pre-sweep hardware check passes, without touching real ports."""
+    from hi_skuggsja_reflectometry import hardware
+
+    monkeypatch.setattr(
+        cli.hardware, "check_hardware",
+        lambda cfg: [hardware.DeviceStatus(n, "test", hardware.OK, "ready") for n in ("R1", "R2", "TOptica")],
+    )
+
+
 def test_help_lists_subcommands():
     result = runner.invoke(cli.app, ["--help"])
     assert result.exit_code == 0
@@ -68,7 +79,7 @@ def test_spec_command_wires_config_defaults_and_calls_sweep(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert captured["sweep_fn"].__name__ == "sweep_spec"
-    assert captured["axes"] == [large, small]
+    assert [axis.inner for axis in captured["axes"]] == [large, small]  # wrapped for the live view
 
     (_large, _small, cfg, start_angle, end_angle, step,
      freq_start, freq_stop, int_time, filename, set_zero, overwrite) = captured["sweep_args"]
@@ -246,3 +257,52 @@ def test_simulate_reports_a_collision_the_real_sweep_would_hit(tmp_path, monkeyp
     assert result.exit_code == 1
     assert "real sweep would stop here too" in result.output
     assert (tmp_path / "run_15.0degrees_3ms_70.0GHz_to_70.5.txt").read_text() == "real data\n"
+
+
+def hardware_fails(monkeypatch):
+    from hi_skuggsja_reflectometry import hardware
+
+    monkeypatch.setattr(
+        cli.hardware, "check_hardware",
+        lambda cfg: [hardware.DeviceStatus("TOptica", "x:1", hardware.FAIL, "no answer at x:1")],
+    )
+
+
+def test_check_command_on_a_simulated_setup():
+    result = runner.invoke(cli.app, ["check", "--no-gui", "--simulate"])
+    assert result.exit_code == 0, result.output
+    assert result.output.count("[ ok ]") == 3
+
+
+def test_check_command_exits_1_when_something_is_not_ready(monkeypatch):
+    hardware_fails(monkeypatch)
+    result = runner.invoke(cli.app, ["check", "--no-gui"])
+    assert result.exit_code == 1
+    assert "[FAIL] TOptica" in result.output
+
+
+def test_sweep_refuses_to_start_if_the_hardware_check_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    hardware_fails(monkeypatch)
+    monkeypatch.setattr(cli, "open_stages", lambda stage_cfg: pytest.fail("opened the stages"))
+
+    result = runner.invoke(cli.app, ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "r"])
+
+    assert result.exit_code == 1
+    assert "nothing was moved" in result.output
+
+
+def test_skip_check_starts_without_checking(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.hardware, "check_hardware", lambda cfg: pytest.fail("checked anyway"))
+    large, small = FakeAxis(), FakeAxis()
+    monkeypatch.setattr(cli, "open_stages", lambda stage_cfg: (large, small))
+    ran = []
+    monkeypatch.setattr(cli, "run_with_emergency_stop", lambda *args, **kwargs: ran.append(True))
+
+    result = runner.invoke(
+        cli.app, ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "r", "--skip-check"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ran == [True]

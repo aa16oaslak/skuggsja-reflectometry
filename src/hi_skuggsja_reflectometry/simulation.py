@@ -32,6 +32,8 @@ SAMPLE_SPEED = 10.0
 # Where the simulated stages "were left" before the run, in degrees.
 START_RECEIVER_ANGLE = 90.0
 START_SAMPLE_ANGLE = 0.0
+SUPPLY_VOLTAGE = 24.0  # reported motor supply, volts
+STATE_IS_HOMED = 0x20  # libximc status flag
 
 
 class SimAxis:
@@ -54,6 +56,7 @@ class SimAxis:
         self._stop_requested = False
         self._open = False
         self._calb = 1.0  # degrees per full step, from set_calb()
+        self.homed = True  # assume the setup was homed before this run
         self._edges = SimpleNamespace(
             LeftBorder=-(10**9), RightBorder=10**9, BorderFlags=0, EnderFlags=0
         )
@@ -109,6 +112,9 @@ class SimAxis:
     def set_calb(self, A: float, MicrostepMode: int) -> None:
         self._calb = A
 
+    def get_calb(self) -> tuple[float, int]:
+        return self._calb, 9
+
     def get_engine_settings(self) -> SimpleNamespace:
         return SimpleNamespace(MicrostepMode=9)
 
@@ -131,12 +137,21 @@ class SimAxis:
         return SimpleNamespace(Position=self.position, EncPosition=0.0)
 
     def get_status(self) -> SimpleNamespace:
+        """Move state, flags, supply voltage and the raw position in full
+        steps + 1/256 microsteps, like the controller's status reply."""
         self._check_open()
         with self._lock:
-            sts = MVCMD_RUNNING if clock.time() < self._t_end else 0
+            now = clock.time()
+            sts = MVCMD_RUNNING if now < self._t_end else 0
             if self._error:
                 sts |= MVCMD_ERROR
-        return SimpleNamespace(MvCmdSts=sts)
+            usteps = round(self._position_at(now) / self._calb * 256)
+            flags = STATE_IS_HOMED if self.homed else 0
+        steps = int(usteps / 256)
+        return SimpleNamespace(
+            MvCmdSts=sts, Flags=flags, Upwr=round(SUPPLY_VOLTAGE * 100),
+            CurPosition=steps, uCurPosition=usteps - steps * 256,
+        )
 
     def command_move_calb(self, position: float) -> None:
         self._check_open()
@@ -169,9 +184,11 @@ class SimAxis:
         while True:
             with self._lock:
                 if self._stop_requested:
+                    self.homed = False
                     return
                 if clock.time() >= self._t_end:
                     self._error = False
+                    self.homed = True
                     return
             clock.sleep(0.02)
 
@@ -185,6 +202,12 @@ class SimScan:
     points: int = 0  # lock-in values read
     freq: float | None = None  # latest frequency set, GHz
     done: bool = False
+
+
+@dataclass
+class _Connection:
+    freq: float = 100.0  # GHz, the frequency the instrument sits at until told otherwise
+    scan: SimScan | None = None
 
 
 class SimToptica:
@@ -222,10 +245,7 @@ class SimToptica:
                 self._handle(conn)
 
     def _handle(self, conn: socket.socket) -> None:
-        sample, receiver = self._angles()
-        record = SimScan(sample, receiver)
-        with self._lock:
-            self.scans.append(record)
+        link = _Connection()
         conn.sendall(b"> ")
         buf = b""
         try:
@@ -236,19 +256,24 @@ class SimToptica:
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    conn.sendall(f"{self._answer(line.decode().strip(), record)}\n> ".encode())
+                    conn.sendall(f"{self._answer(line.decode().strip(), link)}\n> ".encode())
         except OSError:
             pass
         finally:
-            with self._lock:
-                record.done = True
+            if link.scan:
+                with self._lock:
+                    link.scan.done = True
 
-    def _answer(self, cmd: str, record: SimScan) -> str:
+    def _answer(self, cmd: str, link: _Connection) -> str:
         body = cmd.strip("()").split()
         if len(body) >= 2 and body[0] == "param-set!":
             if body[1] == "'frequency:frequency-set":
+                link.freq = float(body[2])
                 with self._lock:
-                    record.freq = float(body[2])
+                    if link.scan is None:  # setting a frequency is what makes a connection a scan
+                        link.scan = SimScan(*self._angles())
+                        self.scans.append(link.scan)
+                    link.scan.freq = link.freq
             return "0"
         if len(body) == 2 and body[0] == "param-ref":
             name = body[1].lstrip("'")
@@ -259,11 +284,12 @@ class SimToptica:
             if name == "lockin:amplifier-gain":
                 return str(self._cfg.gain_default)
             if name == "frequency:frequency-act":
-                return repr((record.freq or 0.0) + self._rng.uniform(-0.002, 0.002))
+                return repr(link.freq + self._rng.uniform(-0.002, 0.002))
             if name == "lockin:lock-in-value-nanoamp":
-                with self._lock:
-                    record.points += 1
-                return f"({self._photocurrent(record.freq or 0.0):.4f} #t)"
+                if link.scan:
+                    with self._lock:
+                        link.scan.points += 1
+                return f"({self._photocurrent(link.freq):.4f} #t)"
             return f"Error: simulator does not know parameter {name}"
         if body and body[0] == "exec":
             return "0"
@@ -283,7 +309,7 @@ class SimRig:
     config to run the sweep with: identical, except the TOptica address
     points at the simulator."""
 
-    def __init__(self, cfg: AppConfig, output_dir: Path) -> None:
+    def __init__(self, cfg: AppConfig, output_dir: Path | None = None) -> None:
         st = cfg.stages
         self.zero_l, self.zero_s = st.zero_l, st.zero_s
         self.large = SimAxis("receiver", RECEIVER_SPEED, st.zero_l - START_RECEIVER_ANGLE)
@@ -294,7 +320,8 @@ class SimRig:
         self.toptica = SimToptica(cfg.toptica, self.angles)
         self.cfg = replace(cfg, toptica=replace(cfg.toptica, host="127.0.0.1", port=self.toptica.port))
         self.output_dir = output_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
         self.t_start = clock.time()
 
     def angles(self) -> tuple[float, float]:

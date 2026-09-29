@@ -15,6 +15,23 @@ class StopWindowUnavailable(RuntimeError):
     display to open it on."""
 
 
+def open_root(what: str, fallback: str):
+    """(tkinter module, a new Tk root window), or StopWindowUnavailable
+    saying `what` can't open and what to do instead."""
+    try:
+        import tkinter as tk
+    except ImportError as exc:
+        raise StopWindowUnavailable(
+            f"tkinter is not available in this Python, so {what} can't open.\n{fallback}"
+        ) from exc
+    try:
+        return tk, tk.Tk()
+    except tk.TclError as exc:
+        raise StopWindowUnavailable(
+            f"Could not open {what} (no display?).\n{fallback}\nOriginal error: {exc}"
+        ) from exc
+
+
 class StopWindow:
     """Always-on-top window with a big STOP button, shown for as long as the
     sweep thread runs.
@@ -32,23 +49,10 @@ class StopWindow:
     window_title = "reflecto - emergency stop"
 
     def __init__(self, estop: EmergencyStop, title: str) -> None:
-        try:
-            import tkinter as tk
-        except ImportError as exc:
-            raise StopWindowUnavailable(
-                "tkinter is not available in this Python, so the stop window can't open.\n"
-                "Rerun with --no-gui to use Ctrl+C in the terminal instead."
-            ) from exc
-        try:
-            self.root = tk.Tk()
-        except tk.TclError as exc:
-            raise StopWindowUnavailable(
-                "Could not open the stop window (no display?).\n"
-                "Rerun with --no-gui to use Ctrl+C in the terminal instead.\n"
-                f"Original error: {exc}"
-            ) from exc
-
-        self.tk = tk
+        self.tk, self.root = open_root(
+            "the stop window", "Rerun with --no-gui to use Ctrl+C in the terminal instead."
+        )
+        tk = self.tk
         self._estop = estop
         self._title = title
         self._t0 = time.monotonic()

@@ -1,9 +1,16 @@
 import pytest
 
-from hi_skuggsja_reflectometry import clock, simulation
+from hi_skuggsja_reflectometry import clock, simulation, toptica
 from hi_skuggsja_reflectometry import config as cfgmod
 
 FAST = 1000  # clock speed for simulated runs in tests
+
+
+@pytest.fixture(autouse=True)
+def fresh_toptica_status():
+    """toptica.progress and toptica.link are module-wide; start each test clean."""
+    toptica.progress.reset()
+    toptica.link.reset()
 
 
 @pytest.fixture

@@ -68,6 +68,24 @@ change -- anything you don't set falls back to the packaged default. If you
 run commands from a different folder, point at it explicitly with
 `--config path\to\reflecto.toml`.
 
+## Check the hardware
+
+```powershell
+reflecto check
+```
+
+Opens a window with a light for each device: the receiver stage (R1), the
+sample stage (R2) and the TOptica. Green is ready, amber works but needs a
+look, red is not usable. Each row says why: for example the COM port can't
+be opened, the controller is in alarm or its motor supply is off, the stage
+has not been homed since it was switched on, the TOptica does not answer at
+the configured address, or its lock-in settings are ones a scan would refuse.
+"Check again" re-runs it. The check only reads status: nothing moves and no
+setting changes.
+
+`--no-gui` just prints the result (exit code 0 if everything is usable, 1
+if not), and `--simulate` checks a simulated setup, e.g. to see the window.
+
 ## Run a sweep
 
 ```powershell
@@ -81,11 +99,22 @@ before the sweep (requires typing `clear` to confirm the homing path is
 clear of obstacles, since homing can move stages outside their normal
 operating range).
 
-While a sweep runs, a small always-on-top window with a red **STOP** button
-is shown. Clicking it (or pressing Esc while that window is focused, closing
-the window, or pressing Ctrl+C in the terminal) stops both stages
-immediately, saves any data already collected, and disconnects the devices
-cleanly. The window closes by itself when the sweep ends.
+Every sweep starts with the same hardware check as `reflecto check`, printed
+in the terminal. If a device is not usable, the sweep stops there, before
+anything has moved. (`--skip-check` starts anyway, for the case where you
+are sure the check itself is wrong.)
+
+While a sweep runs, an always-on-top window shows the setup from above, like
+Fig. 1 of [arXiv:2407.05512](https://arxiv.org/abs/2407.05512) (see *Test a
+sweep without hardware* below), with a light per device and a red **STOP**
+button. The lights follow the sweep's own communication with each device:
+green while it answers, red with the error as soon as one stops answering.
+The drawing and lights never talk to the hardware themselves.
+
+Clicking STOP (or pressing Esc while that window is focused, closing the
+window, or pressing Ctrl+C in the terminal) stops both stages immediately,
+saves any data already collected, and disconnects the devices cleanly. The
+window closes by itself when the sweep ends.
 
 With `--no-gui` no window is opened and Ctrl+C in the terminal is the stop,
 e.g. when running over a remote shell without a display.
@@ -112,8 +141,9 @@ ones, and the simulation is plainly labelled everywhere it shows up.
   the receiver moving on its ring (with its allowed range), the sample and
   its normal, the angles φ1 (incidence) and φ2 (receiver, from the normal),
   and the planned receiver positions. Next to it: both stage angles against
-  the plan, scan progress, the output file, and warnings, e.g. when a stage
-  is outside its soft limits. The STOP button works as in a real sweep.
+  the plan, scan progress, the output file, the hardware lights, and
+  warnings, e.g. when a stage is outside its soft limits. The STOP button
+  works as in a real sweep.
 - Time runs 20x faster by default (`--speed` to change it). Settle times,
   stage travel and the printed estimates stay in real-world seconds.
 - Output files (with a made-up photocurrent) go to `reflecto_simulated/`,

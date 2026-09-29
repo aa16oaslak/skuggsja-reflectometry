@@ -6,9 +6,10 @@ from pathlib import Path
 
 import typer
 
-from . import clock, live_view, simulation, sweeps, toptica
+from . import clock, hardware, live_view, simulation, sweeps, toptica
 from . import config as cfgmod
 from .emergency_stop import run_with_emergency_stop
+from .hardware_window import HardwareCheckWindow
 from .stages import HardwareUnavailable, open_stages
 from .stop_window import StopWindowUnavailable
 
@@ -47,6 +48,66 @@ SPEED_OPTION = typer.Option(
     help=f"With --simulate: how many times faster than real time to run (default {DEFAULT_SIM_SPEED:g}).",
 )
 SIM_OUTPUT_DIR = Path("reflecto_simulated")
+SKIP_CHECK_OPTION = typer.Option(
+    False, "--skip-check",
+    help="Start even if the hardware check before the sweep reports a problem. Only if you are sure the check is wrong.",
+)
+
+
+@app.command()
+def check(
+    gui: bool = typer.Option(True, "--gui/--no-gui", help="Show the result in a window (default), or just print it."),
+    simulate: bool = typer.Option(False, "--simulate", help="Check a simulated setup instead, e.g. to try the window."),
+    config: Path | None = CONFIG_OPTION,
+) -> None:
+    """Check that both stages and the TOptica are connected and ready. Reads status only: nothing moves."""
+    cfg = cfgmod.load_config(config)
+    rig = simulation.SimRig(cfg) if simulate else None
+    try:
+        run_check = (lambda: hardware.check_simulated(rig)) if rig else (lambda: hardware.check_hardware(cfg))
+        if gui:
+            statuses = HardwareCheckWindow(run_check, hardware.unchecked(cfg, simulate, "checking...")).run()
+        else:
+            statuses = run_check()
+    except StopWindowUnavailable as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(code=1)
+    finally:
+        if rig:
+            rig.close()
+    if statuses is None:  # the window was closed before the check finished
+        raise typer.Exit(code=1)
+    typer.echo(hardware.format_statuses(statuses))
+    raise typer.Exit(code=0 if hardware.all_usable(statuses) else 1)
+
+
+def _preflight(run_check, cfg: cfgmod.AppConfig, skip: bool, simulated: bool) -> list[hardware.DeviceStatus]:
+    """The hardware check before a sweep. Exits, before anything has moved,
+    if a device is not usable."""
+    if skip:
+        typer.echo("Skipping the hardware check (--skip-check).")
+        return hardware.unchecked(cfg, simulated, "not checked (--skip-check)")
+    typer.echo("Checking the hardware (reads status only, nothing moves)...")
+    statuses = run_check()
+    typer.echo(hardware.format_statuses(statuses))
+    if not hardware.all_usable(statuses):
+        typer.echo(
+            "Error: the hardware check found a problem, so nothing was moved. Fix it and try again "
+            "('reflecto check' shows the status), or add --skip-check if you are sure the check is wrong."
+        )
+        raise typer.Exit(code=1)
+    return statuses
+
+
+def _watch(axis) -> hardware.WatchedAxis:
+    """Wraps a calibrated stage for the live view, and reads its status once
+    so the view starts where the stage is."""
+    watched = hardware.WatchedAxis(axis)
+    try:
+        watched.get_status()
+    except Exception:  # noqa: BLE001, S110 -- shows as a red light, and the sweep's first move reports it too
+        pass
+    return watched
 
 
 @config_app.command("init")
@@ -78,6 +139,7 @@ def _run(
     gui: bool,
     simulate: bool,
     speed: float | None,
+    skip_check: bool,
     config_path: Path | None,
 ) -> None:
     if speed is not None and (not simulate or speed <= 0):
@@ -102,13 +164,19 @@ def _run(
                        "add --overwrite to simulate anyway.")
         raise typer.Exit(code=1)
 
+    toptica.link.reset()  # fresh live status for this sweep
+    toptica.progress.reset()
+    plan = plan_fn(start_angle, end_angle, step)
+
     if simulate:
         _simulate(
-            sweep_fn, plan_fn, title, cfg, start_angle, end_angle, step,
+            sweep_fn, plan, title, cfg, start_angle, end_angle, step,
             freq_start, freq_stop, int_time, filename, set_zero, gui,
-            DEFAULT_SIM_SPEED if speed is None else speed,
+            DEFAULT_SIM_SPEED if speed is None else speed, skip_check,
         )
         return
+
+    checked = _preflight(lambda: hardware.check_hardware(cfg), cfg, skip_check, simulated=False)
 
     try:
         large_stage, small_stage = open_stages(cfg.stages)
@@ -116,13 +184,16 @@ def _run(
         typer.echo(f"Error: {e}")
         raise typer.Exit(code=1)
 
+    large, small = _watch(large_stage), _watch(small_stage)
+    files = [s.output_file(filename, int_time, freq_start, freq_stop) for s in plan]
+    source = live_view.SweepSource(large, small, cfg.stages, checked, simulated=False)
     try:
         run_with_emergency_stop(
             sweep_fn,
-            [large_stage, small_stage],
+            [large, small],
             list(sweeps.STAGE_NAMES),
-            large_stage,
-            small_stage,
+            large,
+            small,
             cfg,
             start_angle,
             end_angle,
@@ -135,6 +206,7 @@ def _run(
             overwrite,
             gui=gui,
             title=title,
+            window=live_view.live_window(source, plan, files, cfg.stages),
         )
     except (FileExistsError, StopWindowUnavailable) as e:
         typer.echo(f"Error: {e}")
@@ -143,7 +215,7 @@ def _run(
 
 def _simulate(
     sweep_fn,
-    plan_fn,
+    plan: list[sweeps.PlannedStep],
     title: str,
     cfg: cfgmod.AppConfig,
     start_angle: float,
@@ -156,6 +228,7 @@ def _simulate(
     set_zero: bool,
     gui: bool,
     speed: float,
+    skip_check: bool,
 ) -> None:
     """Runs the same sweep code against simulated stages and TOptica, and
     prints planned-vs-actual angles for every step afterwards."""
@@ -166,19 +239,19 @@ def _simulate(
     with clock.accelerated(speed):
         rig = simulation.SimRig(cfg, SIM_OUTPUT_DIR)
         sim_filename = str(SIM_OUTPUT_DIR / filename)
-        plan = plan_fn(start_angle, end_angle, step)
         files = [s.output_file(sim_filename, int_time, freq_start, freq_stop) for s in plan]
-        freq_points = len(toptica.frequency_grid(freq_start, freq_stop, cfg.toptica.freq_step))
-        window = live_view.live_window(rig, plan, files, freq_points, cfg.stages)
         t0 = time.monotonic()
         ran = False
         try:
+            checked = _preflight(lambda: hardware.check_simulated(rig), cfg, skip_check, simulated=True)
+            large, small = _watch(rig.large), _watch(rig.small)
+            source = live_view.SweepSource(large, small, cfg.stages, checked, simulated=True)
             run_with_emergency_stop(
                 sweep_fn,
-                [rig.large, rig.small],
+                [large, small],
                 list(sweeps.STAGE_NAMES),
-                rig.large,
-                rig.small,
+                large,
+                small,
                 rig.cfg,
                 start_angle,
                 end_angle,
@@ -191,7 +264,7 @@ def _simulate(
                 True,  # replace files from earlier simulations
                 gui=gui,
                 title=f"{title} (simulated)",
-                window=window,
+                window=live_view.live_window(source, plan, files, cfg.stages),
             )
             ran = True
         except StopWindowUnavailable as e:
@@ -221,13 +294,14 @@ def spec(
     gui: bool = GUI_OPTION,
     simulate: bool = SIMULATE_OPTION,
     speed: float | None = SPEED_OPTION,
+    skip_check: bool = SKIP_CHECK_OPTION,
     config: Path | None = CONFIG_OPTION,
 ) -> None:
     """Run a specular (theta-2theta) reflectometry sweep."""
     title = f"Specular sweep: sample {start_angle}° to {end_angle}° in {step}° steps"
     _run(
         sweeps.sweep_spec, sweeps.plan_spec, title, start_angle, end_angle, step, freq_start, freq_stop,
-        int_time, filename, set_zero, overwrite, gui, simulate, speed, config,
+        int_time, filename, set_zero, overwrite, gui, simulate, speed, skip_check, config,
     )
 
 
@@ -249,13 +323,14 @@ def nonspec(
     gui: bool = GUI_OPTION,
     simulate: bool = SIMULATE_OPTION,
     speed: float | None = SPEED_OPTION,
+    skip_check: bool = SKIP_CHECK_OPTION,
     config: Path | None = CONFIG_OPTION,
 ) -> None:
     """Run a non-specular reflectometry sweep (receiver stage only)."""
     title = f"Non-specular sweep: receiver {start_angle}° to {end_angle}° in {step}° steps"
     _run(
         sweeps.sweep_nonspec, sweeps.plan_nonspec, title, start_angle, end_angle, step, freq_start, freq_stop,
-        int_time, filename, set_zero, overwrite, gui, simulate, speed, config,
+        int_time, filename, set_zero, overwrite, gui, simulate, speed, skip_check, config,
     )
 
 
