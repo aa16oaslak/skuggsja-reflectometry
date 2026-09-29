@@ -25,6 +25,15 @@ class StageConfig:
     res_small: float
     angle_min: float
     angle_max: float
+    # Seen from above, the way the receiver moves away from Tx as its angle
+    # grows. Only changes how the live view draws the setup, never a move.
+    receiver_turns: str = "counterclockwise"
+
+    def __post_init__(self) -> None:
+        if self.receiver_turns not in ("clockwise", "counterclockwise"):
+            raise ValueError(
+                f"[stages] receiver_turns must be 'clockwise' or 'counterclockwise', not {self.receiver_turns!r}"
+            )
 
 
 @dataclass

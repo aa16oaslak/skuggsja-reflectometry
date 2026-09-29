@@ -91,3 +91,13 @@ def test_follows_a_whole_simulated_sweep_and_closes_at_the_end(rig):
 
     assert len(rig.toptica.scans) == len(plan)
     assert window._source.scan().started == len(plan)
+
+
+@pytest.mark.parametrize("turns, below_tx", [("clockwise", True), ("counterclockwise", False)])
+def test_receiver_side_follows_receiver_turns(turns, below_tx):
+    # canvas y grows downwards; Tx is drawn to the right of the centre
+    tx_x, tx_y = live_view.screen_point(0, 100, 270, turns)
+    rx_x, rx_y = live_view.screen_point(90, 100, 270, turns)
+    assert (tx_x, tx_y) == (370, 270)
+    assert (rx_y > 270) is below_tx
+    assert rx_x == pytest.approx(270)

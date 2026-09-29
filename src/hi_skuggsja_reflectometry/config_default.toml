@@ -13,6 +13,10 @@ res_large = 0.0072   # degrees per microstep, large stage
 res_small = 0.015    # degrees per microstep, small stage
 angle_min = 30       # degrees, soft limit
 angle_max = 180.0    # degrees, soft limit
+# Seen from above, the way the receiver moves away from Tx as its angle grows:
+# "counterclockwise" on this setup, "clockwise" in Fig. 1 of arXiv:2407.05512.
+# Only changes how the live view draws the setup, never which way a stage moves.
+receiver_turns = "counterclockwise"
 
 [toptica]
 host = "192.0.2.1"  # placeholder -- override in reflecto.toml with the real instrument address

@@ -68,6 +68,11 @@ change -- anything you don't set falls back to the packaged default. If you
 run commands from a different folder, point at it explicitly with
 `--config path\to\reflecto.toml`.
 
+`receiver_turns` under `[stages]` says which way the live view draws the
+receiver moving away from Tx, seen from above: `"counterclockwise"` on this
+setup (the default), `"clockwise"` as in Fig. 1 of arXiv:2407.05512. It only
+changes the drawing, never which way a stage moves.
+
 ## Check the hardware
 
 ```powershell

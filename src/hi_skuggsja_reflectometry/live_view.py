@@ -2,9 +2,11 @@
 like Fig. 1 of Singh et al., arXiv:2407.05512, next to the STOP button and
 the hardware status lights.
 
-Angles are drawn clockwise from the transmitter (Tx, fixed, to the right),
-as in the paper's figure. The receiver (Rx) moves on the R1 ring; the
-sample turns on R2 in the middle.
+The transmitter (Tx, fixed) is drawn to the right; angles grow from it
+clockwise or counterclockwise as [stages] receiver_turns says, so the
+drawing matches the real setup seen from above (the paper's figure is
+clockwise). The receiver (Rx) moves on the R1 ring; the sample turns on R2
+in the middle.
 
 Everything shown comes from the sweep's own communication with the
 hardware (see SweepSource); the window never talks to the hardware."""
@@ -35,6 +37,14 @@ _SAMPLE, _NORMAL, _GHOST = "#6d4c41", "#8d6e63", "#bdbdbd"
 _RX, _RX_MOVING, _BAD = "#37474f", "#1565c0", "#c62828"
 _DONE, _CURRENT = "#2e7d32", "#ef6c00"
 _SIM_BANNER, _REAL_BANNER = "#1565c0", "#e65100"
+
+
+def screen_point(angle: float, radius: float, centre: float, turns: str) -> tuple[float, float]:
+    """Canvas (x, y) of a point at `angle` degrees from the Tx direction
+    (to the right). Canvas y grows downwards, so clockwise is +sin."""
+    a = math.radians(angle)
+    sign = -1 if turns == "counterclockwise" else 1
+    return centre + radius * math.cos(a), centre + sign * radius * math.sin(a)
 
 
 class SweepSource:
@@ -129,6 +139,7 @@ class LiveSweepWindow(StopWindow):
         self._source, self._plan, self._files = source, plan, files
         self._limits = (stage_cfg.angle_min, stage_cfg.angle_max)
         self._receiver_home = geometry.receiver_angle(0.0, stage_cfg.zero_l)
+        self._turns = stage_cfg.receiver_turns
 
         banner = (
             ("SIMULATION - no hardware is used", _SIM_BANNER)
@@ -218,25 +229,25 @@ class LiveSweepWindow(StopWindow):
     # -- drawing -------------------------------------------------------------------
 
     def _xy(self, angle: float, radius: float) -> tuple[float, float]:
-        a = math.radians(angle)
-        c = self.SIZE / 2
-        return c + radius * math.cos(a), c + radius * math.sin(a)
+        return screen_point(angle, radius, self.SIZE / 2, self._turns)
 
     def _box(self, angle: float, radius: float, half: float, **style) -> None:
         """A square on the ring, turned to face the centre."""
         x, y = self._xy(angle, radius)
-        a = math.radians(angle)
-        ux, uy, vx, vy = math.cos(a), math.sin(a), -math.sin(a), math.cos(a)
+        c = self.SIZE / 2
+        ux, uy = (x - c) / radius, (y - c) / radius  # unit vector from the centre
+        vx, vy = -uy, ux
         corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
         points = [coord for sx, sy in corners for coord in (x + (sx * ux + sy * vx) * half, y + (sx * uy + sy * vy) * half)]
         self.canvas.create_polygon(*points, **style)
 
     def _arc(self, radius: float, start: float, end: float, **style) -> None:
         c = self.SIZE / 2
-        # Tk measures arcs counter-clockwise; our angles run clockwise.
+        # Tk measures arc angles counterclockwise on screen.
+        tk_start = start if self._turns == "counterclockwise" else -end
         self.canvas.create_arc(
             c - radius, c - radius, c + radius, c + radius,
-            start=-end, extent=end - start, style="arc", **style,
+            start=tk_start, extent=end - start, style="arc", **style,
         )
 
     def _draw(self, sample: float | None, receiver: float | None, k: int, scanning: bool) -> None:

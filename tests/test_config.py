@@ -1,3 +1,5 @@
+import pytest
+
 from hi_skuggsja_reflectometry import config as cfgmod
 
 
@@ -48,3 +50,16 @@ def test_write_default_config_round_trips(tmp_path):
     cfg = cfgmod.load_config(dest)
     assert cfg.stages.zero_l == 180.5
     assert cfg.toptica.host == "192.0.2.1"
+
+
+def test_receiver_turns_defaults_to_this_setup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert cfgmod.load_config().stages.receiver_turns == "counterclockwise"
+
+
+def test_receiver_turns_rejects_anything_else(tmp_path):
+    override = tmp_path / "custom.toml"
+    override.write_text('[stages]\nreceiver_turns = "left"\n')
+
+    with pytest.raises(ValueError, match="receiver_turns"):
+        cfgmod.load_config(override)
