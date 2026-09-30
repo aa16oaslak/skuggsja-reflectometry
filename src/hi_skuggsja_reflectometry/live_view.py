@@ -2,11 +2,10 @@
 like Fig. 1 of Singh et al., arXiv:2407.05512, next to the STOP button and
 the hardware status lights.
 
-The transmitter (Tx, fixed) is drawn to the right; angles grow from it
-clockwise or counterclockwise as [stages] receiver_turns says, so the
-drawing matches the real setup seen from above (the paper's figure is
-clockwise). The receiver (Rx) moves on the R1 ring; the sample turns on R2
-in the middle.
+How the drawing is turned and which way angles grow come from the [view]
+settings, so it can be made to look like the table from where you stand;
+`reflecto position` sets them against the real arms. The receiver (Rx)
+moves on the R1 ring; the sample turns on R2 in the middle.
 
 Everything shown comes from the sweep's own communication with the
 hardware (see SweepSource); the window never talks to the hardware."""
@@ -14,9 +13,10 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import clock, geometry, toptica
 from .hardware import FAIL, OK, WARN, DeviceStatus
@@ -26,7 +26,7 @@ from .stop_window import StopWindow
 if TYPE_CHECKING:
     import threading
 
-    from .config import StageConfig
+    from .config import AppConfig, StageConfig, ViewConfig
     from .emergency_stop import EmergencyStop
     from .hardware import WatchedAxis
     from .monitoring import ScanSnapshot
@@ -38,13 +38,160 @@ _RX, _RX_MOVING, _BAD = "#37474f", "#1565c0", "#c62828"
 _DONE, _CURRENT = "#2e7d32", "#ef6c00"
 _SIM_BANNER, _REAL_BANNER = "#1565c0", "#e65100"
 
+Verdict = Callable[[], "tuple[bool, list[str]]"]
 
-def screen_point(angle: float, radius: float, centre: float, turns: str) -> tuple[float, float]:
-    """Canvas (x, y) of a point at `angle` degrees from the Tx direction
-    (to the right). Canvas y grows downwards, so clockwise is +sin."""
-    a = math.radians(angle)
-    sign = -1 if turns == "counterclockwise" else 1
-    return centre + radius * math.cos(a), centre + sign * radius * math.sin(a)
+
+def _sense(view: ViewConfig) -> int:
+    """+1 if angles grow counterclockwise on screen, -1 if clockwise."""
+    return 1 if view.receiver_turns == "counterclockwise" else -1
+
+
+def screen_point(angle: float, radius: float, centre: float, view: ViewConfig) -> tuple[float, float]:
+    """Canvas (x, y) of the point `radius` from the centre at `angle` degrees
+    from the Tx direction, drawn as `view` says. Canvas y grows downwards."""
+    a = math.radians(view.tx_direction + _sense(view) * angle)
+    return centre + radius * math.cos(a), centre - radius * math.sin(a)
+
+
+def arc_angles(start: float, end: float, view: ViewConfig) -> tuple[float, float]:
+    """Tk's (start, extent) for the arc from `start` to `end` degrees from Tx.
+    Tk measures counterclockwise on screen; a negative extent runs clockwise."""
+    s = _sense(view)
+    return view.tx_direction + s * start, s * (end - start)
+
+
+class SetupDrawing:
+    """The setup seen from above on a Tk canvas: Tx, the R1 ring with the
+    receiver's allowed range, the receiver, the sample on R2 with its normal,
+    the angles phi1 and phi2, and the receiver positions a sweep will scan
+    at. Change `view` and redraw to turn or mirror it."""
+
+    SIZE = 540  # canvas, px
+    RING = 205  # R1 ring radius, px
+
+    def __init__(self, tk: Any, parent: Any, stage_cfg: StageConfig, view: ViewConfig) -> None:
+        self.canvas = tk.Canvas(parent, width=self.SIZE, height=self.SIZE, bg="white", highlightthickness=0)
+        self.view = view
+        self._limits = (stage_cfg.angle_min, stage_cfg.angle_max)
+        self._receiver_home = geometry.receiver_angle(0.0, stage_cfg.zero_l)
+
+    def _xy(self, angle: float, radius: float) -> tuple[float, float]:
+        return screen_point(angle, radius, self.SIZE / 2, self.view)
+
+    def _outward(self, x: float, y: float) -> str:
+        """Text anchor that puts a label at (x, y) on the side away from the
+        centre, so it doesn't run back over the lines it labels."""
+        dx, dy = x - self.SIZE / 2, y - self.SIZE / 2
+        if abs(dx) >= abs(dy):
+            return "w" if dx > 0 else "e"
+        return "n" if dy > 0 else "s"
+
+    def _box(self, angle: float, radius: float, half: float, **style: Any) -> None:
+        """A square on the ring, turned to face the centre."""
+        x, y = self._xy(angle, radius)
+        c = self.SIZE / 2
+        ux, uy = (x - c) / radius, (y - c) / radius  # unit vector from the centre
+        vx, vy = -uy, ux
+        corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+        points = [coord for sx, sy in corners for coord in (x + (sx * ux + sy * vx) * half, y + (sx * uy + sy * vy) * half)]
+        self.canvas.create_polygon(*points, **style)
+
+    def _arc(self, radius: float, start: float, end: float, **style: Any) -> None:
+        c = self.SIZE / 2
+        tk_start, tk_extent = arc_angles(start, end, self.view)
+        self.canvas.create_arc(
+            c - radius, c - radius, c + radius, c + radius,
+            start=tk_start, extent=tk_extent, style="arc", **style,
+        )
+
+    def _label(self, angle: float, radius: float, text: str, **style: Any) -> None:
+        x, y = self._xy(angle, radius)
+        self.canvas.create_text(x, y, text=text, anchor=self._outward(x, y), **style)
+
+    def draw(
+        self,
+        sample: float | None,
+        receiver: float | None,
+        plan: Sequence[PlannedStep] = (),
+        step: int = -1,
+        receiver_moving: bool = False,
+    ) -> None:
+        """Redraws everything. `step` is the index of the plan step being
+        scanned or moved to (earlier ones show as scanned); -1 for none."""
+        cv, R, c = self.canvas, self.RING, self.SIZE / 2
+        cv.delete("all")
+        lo, hi = self._limits
+
+        # R1 ring: dotted, solid over the receiver's allowed range
+        cv.create_oval(c - R, c - R, c + R, c + R, outline=_RING, dash=(2, 4), width=2)
+        self._arc(R, lo, hi, outline=_RANGE, width=5)
+        hx, hy = self._xy(self._receiver_home, R + 16)
+        cv.create_text(hx, hy, text="home", fill=_RING, font=("Helvetica", 8))
+
+        # planned receiver positions
+        for i, planned in enumerate(plan):
+            x, y = self._xy(planned.receiver, R + 14)
+            if 0 <= step and i < step:
+                fill, outline = _DONE, _DONE
+            elif i == step:
+                fill, outline = _CURRENT, _CURRENT
+            else:
+                fill, outline = "white", _BEAM
+            if not lo <= planned.receiver <= hi:
+                outline = _BAD
+            cv.create_oval(x - 5, y - 5, x + 5, y + 5, fill=fill, outline=outline, width=2)
+            if len(plan) <= 12:
+                tx, ty = self._xy(planned.receiver, R + 28)
+                cv.create_text(tx, ty, text=str(i + 1), fill=_BEAM, font=("Helvetica", 8))
+
+        # Tx (fixed) and the Tx beam
+        cv.create_line(c, c, *self._xy(0, R), fill=_BEAM, width=2)
+        self._box(0, R, 12, fill="white", outline=_RX, width=2)
+        self._label(0, R + 18, "Tx", fill=_RX, font=("Helvetica", 11, "bold"))
+
+        if sample is not None:
+            # sample normal, the sample on R2 perpendicular to it, and phi1
+            cv.create_line(c, c, *self._xy(sample, R - 12), fill=_NORMAL, dash=(6, 4))
+            self._arc(55, 0, sample, outline=_SAMPLE)
+            self._label(sample / 2, 62, f"φ1 {sample:.1f}°", fill=_SAMPLE, font=("Helvetica", 9))
+            (x0, y0), (x1, y1) = self._xy(sample + 90, 42), self._xy(sample - 90, 42)
+            cv.create_line(x0, y0, x1, y1, fill=_SAMPLE, width=6)
+            self._label(sample - 90, 48, "Sample (R2)", fill=_SAMPLE, font=("Helvetica", 9, "bold"))
+        cv.create_oval(c - 4, c - 4, c + 4, c + 4, fill="white", outline=_SAMPLE, width=2)
+
+        if sample is not None and receiver is not None:
+            if not geometry.is_specular(sample, receiver):  # where a specular receiver would be
+                x, y = self._xy(2 * sample, R)
+                cv.create_line(c, c, x, y, fill=_GHOST, dash=(2, 3))
+                self._box(2 * sample, R, 10, fill="", outline=_GHOST, width=2)
+                gx, gy = self._xy(2 * sample, R - 28)
+                cv.create_text(gx, gy, text="specular", fill=_GHOST, font=("Helvetica", 8))
+            self._arc(80, sample, receiver, outline=_SAMPLE)
+            self._label((sample + receiver) / 2, 87, f"φ2 {receiver - sample:.1f}°", fill=_SAMPLE, font=("Helvetica", 9))
+
+        if receiver is not None:
+            cv.create_line(c, c, *self._xy(receiver, R), fill=_BEAM, width=2)
+            outside = not lo - 0.01 <= receiver <= hi + 0.01
+            colour = _BAD if outside else (_RX_MOVING if receiver_moving else _RX)
+            self._box(receiver, R, 12, fill=colour, outline=colour)
+            x, y = self._xy(receiver, R - 30)
+            cv.create_text(x, y, text="Rx", fill=colour, font=("Helvetica", 11, "bold"))
+        if sample is None or receiver is None:
+            cv.create_text(c, c + 30, text="stage position not known yet", fill=_BAD, font=("Helvetica", 9))
+
+        # legend
+        cv.create_line(12, 16, 40, 16, fill=_RANGE, width=5)
+        cv.create_text(46, 16, text=f"receiver range (soft limits {lo:g}°-{hi:g}°)", anchor="w",
+                       fill=_RANGE, font=("Helvetica", 9))
+        if plan:
+            for j, (fill, label) in enumerate(((_DONE, "scanned"), (_CURRENT, "current"), ("white", "planned"))):
+                y = 36 + 16 * j
+                cv.create_oval(21, y - 5, 31, y + 5, fill=fill, outline=_BEAM if fill == "white" else fill, width=2)
+                cv.create_text(46, y, text=label, anchor="w", fill=_RANGE, font=("Helvetica", 9))
+        cv.create_text(self.SIZE - 8, self.SIZE - 24, anchor="e", fill=_RANGE, font=("Helvetica", 8),
+                       text=f"Seen from above. Angles grow {self.view.receiver_turns} from Tx.")
+        cv.create_text(self.SIZE - 8, self.SIZE - 10, anchor="e", fill=_GHOST, font=("Helvetica", 8),
+                       text="After Fig. 1 of Singh et al., arXiv:2407.05512")
 
 
 class SweepSource:
@@ -114,11 +261,13 @@ class SweepSource:
 
 class LiveSweepWindow(StopWindow):
     """The STOP window plus the hardware lights, a live drawing of the setup,
-    and readouts: stage angles against the plan, phi1/phi2, scan progress."""
+    and readouts: stage angles against the plan, phi1/phi2, scan progress.
+
+    With a `verdict` (a simulation run before the real sweep), the window
+    stays open when the sweep ends, shows the verdict, and asks whether to
+    run the sweep on the real hardware; the answer is left in `decision`."""
 
     poll_ms = 50
-    SIZE = 540  # canvas, px
-    RING = 205  # R1 ring radius, px
 
     def __init__(
         self,
@@ -127,7 +276,8 @@ class LiveSweepWindow(StopWindow):
         source: SweepSource,
         plan: list[PlannedStep],
         files: list[str],
-        stage_cfg: StageConfig,
+        cfg: AppConfig,
+        verdict: Verdict | None = None,
     ) -> None:
         self.window_title = (
             "reflecto - SIMULATION (no hardware)" if source.simulated else "reflecto - sweep (real hardware)"
@@ -137,15 +287,16 @@ class LiveSweepWindow(StopWindow):
         from tkinter import ttk
 
         self._source, self._plan, self._files = source, plan, files
-        self._limits = (stage_cfg.angle_min, stage_cfg.angle_max)
-        self._receiver_home = geometry.receiver_angle(0.0, stage_cfg.zero_l)
-        self._turns = stage_cfg.receiver_turns
+        self._limits = (cfg.stages.angle_min, cfg.stages.angle_max)
+        self._verdict = verdict
+        self.decision: bool | None = None
 
-        banner = (
-            ("SIMULATION - no hardware is used", _SIM_BANNER)
-            if source.simulated
-            else ("REAL HARDWARE - the stages will move", _REAL_BANNER)
-        )
+        if verdict is not None:
+            banner = ("SIMULATION before the real sweep - nothing moves yet", _SIM_BANNER)
+        elif source.simulated:
+            banner = ("SIMULATION - no hardware is used", _SIM_BANNER)
+        else:
+            banner = ("REAL HARDWARE - the stages will move", _REAL_BANNER)
         tk.Label(
             self.controls, text=banner[0], bg=banner[1], fg="white", font=("Helvetica", 12, "bold"), pady=4,
         ).pack(fill="x", before=self.status)
@@ -161,11 +312,15 @@ class LiveSweepWindow(StopWindow):
         )
         self.warning.pack(fill="x", padx=16, before=self.button)
 
-        self.canvas = tk.Canvas(self.root, width=self.SIZE, height=self.SIZE, bg="white", highlightthickness=0)
-        self.canvas.pack(side="left")
+        self.drawing = SetupDrawing(tk, self.root, cfg.stages, cfg.view)
+        self.drawing.canvas.pack(side="left")
         self._refresh()
 
     # -- state -------------------------------------------------------------------
+
+    def _step(self, scan: ScanSnapshot) -> int:
+        """Index of the plan step being scanned, or moved to."""
+        return scan.started - 1 if scan.active else scan.started
 
     def _refresh(self) -> None:
         super()._refresh()
@@ -173,9 +328,9 @@ class LiveSweepWindow(StopWindow):
             self.status.config(text=self._title)  # elapsed time is in the readouts
         sample, receiver = self._source.angles()
         scan = self._source.scan()
-        k = scan.started - 1 if scan.active else scan.started  # step being scanned, or moved to
+        k = self._step(scan)
         self.hardware.show(self._source.devices())
-        self._draw(sample, receiver, k, scan.active)
+        self.drawing.draw(sample, receiver, self._plan, k, receiver_moving=self._source.large.snapshot()[1])
         self._update_readouts(sample, receiver, k, scan)
 
     def _update_readouts(self, sample: float | None, receiver: float | None, k: int, scan: ScanSnapshot) -> None:
@@ -226,116 +381,80 @@ class LiveSweepWindow(StopWindow):
             warnings.append("Some planned receiver angles are outside the soft limits (red on the ring).")
         self.warning.config(text="\n".join(warnings))
 
-    # -- drawing -------------------------------------------------------------------
+    # -- the decision after a simulation run before the real sweep ---------------
 
-    def _xy(self, angle: float, radius: float) -> tuple[float, float]:
-        return screen_point(angle, radius, self.SIZE / 2, self._turns)
+    def _poll(self) -> None:
+        if self._verdict is not None and not self._worker.is_alive():
+            self._refresh()  # the final state
+            self._ask_to_run()
+            return
+        super()._poll()
 
-    def _box(self, angle: float, radius: float, half: float, **style) -> None:
-        """A square on the ring, turned to face the centre."""
-        x, y = self._xy(angle, radius)
-        c = self.SIZE / 2
-        ux, uy = (x - c) / radius, (y - c) / radius  # unit vector from the centre
-        vx, vy = -uy, ux
-        corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-        points = [coord for sx, sy in corners for coord in (x + (sx * ux + sy * vx) * half, y + (sx * uy + sy * vy) * half)]
-        self.canvas.create_polygon(*points, **style)
-
-    def _arc(self, radius: float, start: float, end: float, **style) -> None:
-        c = self.SIZE / 2
-        # Tk measures arc angles counterclockwise on screen.
-        tk_start = start if self._turns == "counterclockwise" else -end
-        self.canvas.create_arc(
-            c - radius, c - radius, c + radius, c + radius,
-            start=tk_start, extent=end - start, style="arc", **style,
+    def _ask_to_run(self) -> None:
+        tk = self.tk
+        ok, lines = self._verdict()
+        if self._estop.event.is_set():  # STOP, or an error, ended it early
+            ok = False
+            lines = [f"The simulation did not finish ({self._estop.reason}).", *lines]
+        self.status.config(text="Simulation finished." if ok else "The simulation found a problem.")
+        self.button.pack_forget()
+        self.hint.config(text="Esc or closing this window cancels: nothing will move.")
+        box = tk.Frame(self.controls)
+        box.pack(fill="x", padx=16, pady=6, before=self.hint)
+        self.verdict_text = tk.Label(
+            box, text="\n".join(lines), justify="left", anchor="w", wraplength=340,
+            fg=_DONE if ok else _BAD, font=("Helvetica", 10, "bold"),
         )
+        self.verdict_text.pack(fill="x")
+        buttons = tk.Frame(box)
+        buttons.pack(pady=(10, 0))
+        self.run_button = None
+        if ok:
+            self.run_button = tk.Button(
+                buttons, text="Run on the real hardware", bg=_REAL_BANNER, fg="white",
+                activebackground=_REAL_BANNER, activeforeground="white", font=("Helvetica", 13, "bold"),
+                command=lambda: self._decide(True),
+            )
+            self.run_button.pack(side="left", padx=4, ipady=6)
+        self.cancel_button = tk.Button(
+            buttons, text="Cancel" if ok else "Close", font=("Helvetica", 12), command=lambda: self._decide(False)
+        )
+        self.cancel_button.pack(side="left", padx=4, ipady=6)
+        self.root.protocol("WM_DELETE_WINDOW", lambda: self._decide(False))
+        self.root.bind("<Escape>", lambda _event: self._decide(False))
 
-    def _draw(self, sample: float | None, receiver: float | None, k: int, scanning: bool) -> None:
-        cv, R, c = self.canvas, self.RING, self.SIZE / 2
-        cv.delete("all")
-        lo, hi = self._limits
-
-        # R1 ring: dotted, solid over the receiver's allowed range
-        cv.create_oval(c - R, c - R, c + R, c + R, outline=_RING, dash=(2, 4), width=2)
-        self._arc(R, lo, hi, outline=_RANGE, width=5)
-        hx, hy = self._xy(self._receiver_home, R + 16)
-        cv.create_text(hx, hy, text="home", fill=_RING, font=("Helvetica", 8))
-
-        # planned receiver positions
-        for i, step in enumerate(self._plan):
-            x, y = self._xy(step.receiver, R + 14)
-            if i < k:
-                fill, outline = _DONE, _DONE
-            elif i == k:
-                fill, outline = _CURRENT, _CURRENT
-            else:
-                fill, outline = "white", _BEAM
-            if not lo <= step.receiver <= hi:
-                outline = _BAD
-            cv.create_oval(x - 5, y - 5, x + 5, y + 5, fill=fill, outline=outline, width=2)
-            if len(self._plan) <= 12:
-                tx, ty = self._xy(step.receiver, R + 28)
-                cv.create_text(tx, ty, text=str(i + 1), fill=_BEAM, font=("Helvetica", 8))
-
-        # Tx (fixed) and the Tx beam
-        cv.create_line(c, c, *self._xy(0, R), fill=_BEAM, width=2)
-        self._box(0, R, 12, fill="white", outline=_RX, width=2)
-        x, y = self._xy(0, R)
-        cv.create_text(x, y - 24, text="Tx", fill=_RX, font=("Helvetica", 11, "bold"))
-
-        if sample is not None:
-            # sample normal, the sample on R2 perpendicular to it, and phi1
-            cv.create_line(c, c, *self._xy(sample, R - 12), fill=_NORMAL, dash=(6, 4))
-            self._arc(55, 0, sample, outline=_SAMPLE)
-            x, y = self._xy(sample / 2, 70)
-            cv.create_text(x, y, text=f"φ1 {sample:.1f}°", fill=_SAMPLE, font=("Helvetica", 9), anchor="w")
-            (x0, y0), (x1, y1) = self._xy(sample + 90, 42), self._xy(sample - 90, 42)
-            cv.create_line(x0, y0, x1, y1, fill=_SAMPLE, width=6)
-            x, y = self._xy(sample - 90, 58)
-            cv.create_text(x, y, text="Sample (R2)", fill=_SAMPLE, font=("Helvetica", 9, "bold"))
-        cv.create_oval(c - 4, c - 4, c + 4, c + 4, fill="white", outline=_SAMPLE, width=2)
-
-        if sample is not None and receiver is not None:
-            if not geometry.is_specular(sample, receiver):  # where a specular receiver would be
-                x, y = self._xy(2 * sample, R)
-                cv.create_line(c, c, x, y, fill=_GHOST, dash=(2, 3))
-                self._box(2 * sample, R, 10, fill="", outline=_GHOST, width=2)
-                gx, gy = self._xy(2 * sample, R - 28)
-                cv.create_text(gx, gy, text="specular", fill=_GHOST, font=("Helvetica", 8))
-            self._arc(80, sample, receiver, outline=_SAMPLE)
-            x, y = self._xy((sample + receiver) / 2, 95)
-            cv.create_text(x, y, text=f"φ2 {receiver - sample:.1f}°", fill=_SAMPLE, font=("Helvetica", 9), anchor="w")
-
-        if receiver is not None:
-            cv.create_line(c, c, *self._xy(receiver, R), fill=_BEAM, width=2)
-            moving = self._source.large.snapshot()[1]
-            outside = not lo - 0.01 <= receiver <= hi + 0.01
-            colour = _BAD if outside else (_RX_MOVING if moving else _RX)
-            self._box(receiver, R, 12, fill=colour, outline=colour)
-            x, y = self._xy(receiver, R - 30)
-            cv.create_text(x, y, text="Rx", fill=colour, font=("Helvetica", 11, "bold"))
-        if sample is None or receiver is None:
-            cv.create_text(c, c + 30, text="stage position not known yet", fill=_BAD, font=("Helvetica", 9))
-
-        # legend
-        cv.create_line(12, 16, 40, 16, fill=_RANGE, width=5)
-        cv.create_text(46, 16, text=f"receiver range (soft limits {lo:g}°-{hi:g}°)", anchor="w",
-                       fill=_RANGE, font=("Helvetica", 9))
-        for j, (fill, label) in enumerate(((_DONE, "scanned"), (_CURRENT, "current"), ("white", "planned"))):
-            y = 36 + 16 * j
-            cv.create_oval(21, y - 5, 31, y + 5, fill=fill, outline=_BEAM if fill == "white" else fill, width=2)
-            cv.create_text(46, y, text=label, anchor="w", fill=_RANGE, font=("Helvetica", 9))
-        cv.create_text(self.SIZE - 8, self.SIZE - 10, anchor="e", fill=_GHOST, font=("Helvetica", 8),
-                       text="Top view after Fig. 1 of Singh et al., arXiv:2407.05512")
+    def _decide(self, run: bool) -> None:
+        self.decision = run
+        self.root.destroy()
 
 
-def live_window(source: SweepSource, plan: list[PlannedStep], files: list[str], stage_cfg: StageConfig):
-    """A window function for run_with_emergency_stop(window=...)."""
+class LiveWindow:
+    """A window function for run_with_emergency_stop(window=...). With a
+    `verdict`, the window asks at the end whether to run the sweep on the
+    real hardware, and the answer is left in `decision`."""
 
-    def show(estop: EmergencyStop, worker: threading.Thread, title: str) -> None:
-        LiveSweepWindow(estop, title, source, plan, files, stage_cfg).run(worker)
+    def __init__(
+        self,
+        source: SweepSource,
+        plan: list[PlannedStep],
+        files: list[str],
+        cfg: AppConfig,
+        verdict: Verdict | None = None,
+    ) -> None:
+        self._args = (source, plan, files, cfg, verdict)
+        self.decision: bool | None = None
 
-    return show
+    def __call__(self, estop: EmergencyStop, worker: threading.Thread, title: str) -> None:
+        source, plan, files, cfg, verdict = self._args
+        window = LiveSweepWindow(estop, title, source, plan, files, cfg, verdict)
+        window.run(worker)
+        self.decision = window.decision
+
+
+def live_window(
+    source: SweepSource, plan: list[PlannedStep], files: list[str], cfg: AppConfig, verdict: Verdict | None = None
+) -> LiveWindow:
+    return LiveWindow(source, plan, files, cfg, verdict)
 
 
 def _ago(t: float) -> str:

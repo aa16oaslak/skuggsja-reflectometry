@@ -67,6 +67,7 @@ def test_sim_axis_stops_at_soft_limit_and_flags_it(cfg):
         stages.set_boundaries(axis, cfg.stages.res_large, 30, 180, cfg.stages.zero_l)
 
         axis.command_move_calb(cfg.stages.zero_l - 20)  # receiver angle 20°, below the 30° limit
+        assert not int(axis.get_status().MvCmdSts) & stages.MVCMD_ERROR  # not flagged while still on its way
         wait_until_stopped(axis)
 
         assert int(axis.get_status().MvCmdSts) & stages.MVCMD_ERROR
@@ -181,3 +182,33 @@ def test_nonspec_with_set_zero_leaves_sample_at_home_not_15(rig, monkeypatch):
             str(rig.output_dir / "run"), True, True, threading.Event(),
         )
     assert rig.toptica.scans[0].sample == pytest.approx(-rig.cfg.stages.zero_s)  # 40°, not 15°
+
+
+def test_simulation_can_start_where_the_real_arms_are(cfg):
+    from hi_skuggsja_reflectometry.hardware import ArmReading
+
+    start = (ArmReading(2.4, homed=False, moving=False, speed=12.0), ArmReading(188.73, True, False, None))
+    with clock.accelerated(FAST):
+        rig = simulation.SimRig(cfg, start=start)
+    try:
+        assert (rig.large.position, rig.small.position) == (2.4, 188.73)
+        assert (rig.large.homed, rig.small.homed) == (False, True)
+        assert (rig.large.speed, rig.small.speed) == (12.0, simulation.SAMPLE_SPEED)  # guessed where not read
+        assert rig.speeds_read is False
+        assert rig.angles() == pytest.approx((228.73, 178.1))
+    finally:
+        rig.close()
+
+
+def test_verdict_after_a_full_and_a_cut_short_sweep(rig):
+    plan = sweeps.plan_spec(15.0, 30.0, 7.5)
+    with clock.accelerated(FAST):
+        sweeps.sweep_spec(
+            rig.large, rig.small, rig.cfg, 15.0, 22.5, 7.5, 70.0, 70.5, 3,
+            str(rig.output_dir / "run"), False, True, threading.Event(),
+        )
+
+    ok, lines = rig.verdict(plan[:2])
+    assert ok and lines[0] == "All 2 steps were scanned at the planned angles."
+    ok, lines = rig.verdict(plan)
+    assert not ok and "Only 2 of 3 steps were reached." in lines

@@ -1,5 +1,6 @@
 import socket
 import sys
+from contextlib import contextmanager
 
 import pytest
 from typer.testing import CliRunner
@@ -74,7 +75,7 @@ def test_spec_command_wires_config_defaults_and_calls_sweep(monkeypatch):
 
     result = runner.invoke(
         cli.app,
-        ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "myrun"],
+        ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "myrun", "--skip-preview"],
     )
 
     assert result.exit_code == 0, result.output
@@ -108,7 +109,7 @@ def test_nonspec_command_overrides_freq_defaults_when_given(monkeypatch):
         [
             "nonspec", "--start-angle", "45", "--end-angle", "75", "--step", "15",
             "--filename", "myrun", "--freq-start", "80", "--freq-stop", "300",
-            "--overwrite", "--no-gui",
+            "--overwrite", "--no-gui", "--skip-preview",
         ],
     )
 
@@ -133,7 +134,7 @@ def test_spec_command_reports_file_exists_error_cleanly(monkeypatch):
 
     result = runner.invoke(
         cli.app,
-        ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "run"],
+        ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "run", "--skip-preview"],
     )
 
     assert result.exit_code == 1
@@ -205,7 +206,7 @@ def test_spec_reports_missing_display_cleanly(tmp_path, monkeypatch):
 
     result = runner.invoke(
         cli.app,
-        ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "run"],
+        ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "run", "--skip-preview"],
     )
 
     assert result.exit_code == 1
@@ -241,11 +242,13 @@ def test_simulate_runs_a_whole_sweep_without_touching_hardware(tmp_path, monkeyp
     assert not list(tmp_path.glob("*.txt"))  # nothing where real data goes
 
 
-def test_speed_needs_simulate(tmp_path, monkeypatch):
+def test_speed_only_goes_with_a_simulation(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(cli.app, [*SIM_ARGS, "--speed", "5"])
-    assert result.exit_code == 1
-    assert "--speed needs --simulate" in result.output
+    for extra in (["--skip-preview"], ["--simulate", "--speed", "0"]):
+        speed = [] if "--speed" in extra else ["--speed", "5"]
+        result = runner.invoke(cli.app, [*SIM_ARGS, *extra, *speed])
+        assert result.exit_code == 1
+        assert "--speed sets how fast simulations run" in result.output
 
 
 def test_simulate_reports_a_collision_the_real_sweep_would_hit(tmp_path, monkeypatch):
@@ -301,8 +304,161 @@ def test_skip_check_starts_without_checking(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "run_with_emergency_stop", lambda *args, **kwargs: ran.append(True))
 
     result = runner.invoke(
-        cli.app, ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "r", "--skip-check"]
+        cli.app, ["spec", "--start-angle", "30", "--end-angle", "30", "--step", "7.5", "--filename", "r", "--skip-check", "--skip-preview"]
     )
 
     assert result.exit_code == 0, result.output
     assert ran == [True]
+
+
+# -- the three steps before a real sweep, answered in the terminal ---------------------
+
+PREVIEW_ARGS = [
+    "spec", "--start-angle", "15", "--end-angle", "22.5", "--step", "7.5",
+    "--freq-start", "70", "--freq-stop", "70.5", "--filename", "run", "--no-gui", "--speed", "1000",
+]
+MOVES = ("move_calb", "movr_calb", "homezero", "stop")
+
+
+@pytest.fixture
+def stages_at(monkeypatch):
+    """Replaces the real stages with fakes at the given controller positions:
+    the pair read in step 1 and, unless `moved_to` says otherwise, the same
+    pair for the sweep in step 3."""
+
+    def place(receiver_position, sample_position, moved_to=None):
+        read = (FakeAxis(position=receiver_position), FakeAxis(position=sample_position))
+        swept = read if moved_to is None else (FakeAxis(position=moved_to[0]), FakeAxis(position=moved_to[1]))
+
+        @contextmanager
+        def open_readonly(stage_cfg):
+            yield read
+
+        monkeypatch.setattr(cli.hardware, "open_stages_readonly", open_readonly)
+        monkeypatch.setattr(cli, "open_stages", lambda stage_cfg: swept)
+        return read
+
+    return place
+
+
+@pytest.fixture
+def real_runs(monkeypatch):
+    """Records the sweep sent to the real hardware; simulations run for real."""
+    runs = []
+    real = cli.run_with_emergency_stop
+
+    def run(sweep_fn, axes, names, *args, **kwargs):
+        if kwargs["title"].endswith("(simulated)"):
+            return real(sweep_fn, axes, names, *args, **kwargs)
+        runs.append(args)
+        return None
+
+    monkeypatch.setattr(cli, "run_with_emergency_stop", run)
+    return runs
+
+
+def test_real_sweep_shows_the_arms_simulates_from_there_then_asks(tmp_path, monkeypatch, stages_at, real_runs):
+    monkeypatch.chdir(tmp_path)
+    receiver, sample = stages_at(2.4, -25.0)  # receiver 178.10°, sample 15.00°
+
+    result = runner.invoke(cli.app, PREVIEW_ARGS, input="yes\nrun\n")
+
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert out.index("Step 1 of 3") < out.index("Step 2 of 3") < out.index("Step 3 of 3")
+    assert "Receiver confirmed at 178.10°" in out and "Sample confirmed at 15.00°" in out
+    assert "All 2 steps were scanned at the planned angles." in out
+    assert len(real_runs) == 1
+    assert not any(call[0] in MOVES for axis in (receiver, sample) for call in axis.calls)  # steps 1-2 moved nothing
+
+
+def test_answering_no_about_the_arms_ends_it_before_the_simulation(tmp_path, monkeypatch, stages_at, real_runs):
+    monkeypatch.chdir(tmp_path)
+    stages_at(2.4, -25.0)
+    monkeypatch.setattr(cli, "open_stages", lambda stage_cfg: pytest.fail("opened the stages to move them"))
+
+    result = runner.invoke(cli.app, PREVIEW_ARGS, input="no\n")
+
+    assert result.exit_code == 1
+    assert "Cancelled. Nothing was moved." in result.output
+    assert "Step 2 of 3" not in result.output
+    assert real_runs == []
+
+
+def test_answering_no_after_the_simulation_moves_nothing(tmp_path, monkeypatch, stages_at, real_runs):
+    monkeypatch.chdir(tmp_path)
+    stages_at(2.4, -25.0)
+    monkeypatch.setattr(cli, "open_stages", lambda stage_cfg: pytest.fail("opened the stages to move them"))
+
+    result = runner.invoke(cli.app, PREVIEW_ARGS, input="yes\nno\n")
+
+    assert result.exit_code == 1
+    assert "Cancelled. Nothing was moved." in result.output and "Step 3 of 3" not in result.output
+    assert real_runs == []
+
+
+def test_a_stage_that_moved_after_it_was_confirmed_stops_the_sweep(tmp_path, monkeypatch, stages_at, real_runs):
+    monkeypatch.chdir(tmp_path)
+    stages_at(2.4, -25.0, moved_to=(12.4, -25.0))  # e.g. someone jogged the receiver in XILab meanwhile
+
+    result = runner.invoke(cli.app, PREVIEW_ARGS, input="yes\nrun\n")
+
+    assert result.exit_code == 1
+    assert "moved after its position was confirmed" in result.output
+    assert "receiver 2.40° then, 12.40° now" in result.output
+    assert real_runs == []
+
+
+def test_a_sweep_that_fails_in_the_simulation_is_not_offered_for_the_hardware(
+    tmp_path, monkeypatch, stages_at, real_runs
+):
+    monkeypatch.chdir(tmp_path)
+    stages_at(2.4, -25.0)
+    args = [a if a != "22.5" else "95" for a in PREVIEW_ARGS]
+    args[args.index("--start-angle") + 1] = "80"  # receiver 160° to 190°, past the 180° limit
+
+    result = runner.invoke(cli.app, args, input="yes\nrun\n")
+
+    assert result.exit_code == 1
+    assert "The simulated sweep failed" in result.output
+    assert "Type 'run'" not in result.output
+    assert real_runs == []
+
+
+def test_skip_preview_goes_straight_to_the_hardware(tmp_path, monkeypatch, stages_at, real_runs):
+    monkeypatch.chdir(tmp_path)
+    stages_at(2.4, -25.0)
+    args = [a for a in PREVIEW_ARGS if a not in ("--speed", "1000")]
+
+    result = runner.invoke(cli.app, [*args, "--skip-preview"])
+
+    assert result.exit_code == 0, result.output
+    assert "Step 1 of 3" not in result.output
+    assert len(real_runs) == 1
+
+
+def test_position_prints_where_the_arms_are(stages_at):
+    stages_at(2.4, 188.73)
+
+    result = runner.invoke(cli.app, ["position", "--no-gui"])
+
+    assert result.exit_code == 0, result.output
+    assert "178.10°" in result.output and "228.73°" in result.output
+
+
+def test_position_on_a_simulated_setup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.app, ["position", "--no-gui", "--simulate"])
+    assert result.exit_code == 0, result.output
+    assert "90.00°" in result.output and "0.00°" in result.output
+
+
+def test_a_mistake_in_the_settings_file_is_reported_cleanly(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "reflecto.toml").write_text("[stages]\nzero_L = 181\n")
+
+    result = runner.invoke(cli.app, ["position", "--no-gui", "--simulate"])
+
+    assert result.exit_code == 1
+    assert "unknown setting zero_L under [stages]" in result.output
+    assert isinstance(result.exception, SystemExit)

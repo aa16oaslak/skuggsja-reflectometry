@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import signal
 import threading
 from collections.abc import Callable, Sequence
@@ -116,6 +117,10 @@ def run_with_emergency_stop(
         if worker.is_alive():  # the waiter bailed out early, e.g. the window crashed
             estop.trigger("stop window failed")
             _join(worker)
+        # Free the closed window's Tk objects now, on the main thread. Left to
+        # a later garbage collection, they could be freed from a background
+        # thread, which Tk does not allow (the process aborts).
+        gc.collect()
         restore_ctrl_c()
         _close_axes(axes, names)
 

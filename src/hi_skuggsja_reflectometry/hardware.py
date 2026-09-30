@@ -1,20 +1,23 @@
-"""Is the hardware there and ready?
+"""Is the hardware there and ready, and where are the arms?
 
 Read-only checks of the two rotation stages and the TOptica (they open,
-read status and close; nothing moves and no setting changes), and a stage
-wrapper that reports on a running sweep's own calls without adding any."""
+read status and close; nothing moves and no setting changes), a reader
+that follows where both arms are without moving them, and a stage wrapper
+that reports on a running sweep's own calls without adding any."""
 from __future__ import annotations
 
 import ipaddress
 import socket
 import threading
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from . import geometry, toptica
 from .monitoring import LinkMonitor
-from .stages import MVCMD_ERROR, MVCMD_RUNNING, HardwareUnavailable, _load_ximc
+from .stages import MVCMD_ERROR, MVCMD_RUNNING, HardwareUnavailable, _load_ximc, _open_axis
 
 if TYPE_CHECKING:
     from .config import AppConfig, StageConfig, TopticaConfig
@@ -216,6 +219,149 @@ def _is_placeholder(host: str) -> bool:
         return ipaddress.ip_address(host) in ipaddress.ip_network("192.0.2.0/24")  # the packaged default
     except ValueError:  # a hostname
         return False
+
+
+# -- where the arms are, read without moving them ---------------------------------------
+
+NOT_HOMED_NOTE = (
+    "Not homed since the controller was switched on: its angle comes from counting steps and "
+    "may not match where the arm really is. If the drawing can't be made to match the setup, "
+    "home the stages with --set-zero."
+)
+
+
+@dataclass(frozen=True)
+class ArmReading:
+    """One stage as read from its controller, without moving it."""
+
+    position: float  # calibrated units: degrees from the controller's zero (its home)
+    homed: bool  # homed since the controller was switched on
+    moving: bool
+    speed: float | None = None  # degrees per second set in the controller, if it could be read
+
+
+def read_speed(axis: Any) -> float | None:
+    """The speed moves run at, in degrees per second, from the controller's
+    move settings; None if it can't be read."""
+    try:
+        speed = float(axis.get_move_settings_calb().Speed)
+    except Exception:  # noqa: BLE001 -- only used to time the simulation
+        return None
+    return speed if speed > 0 else None
+
+
+def read_arm(axis: Any, speed: float | None = None) -> ArmReading:
+    status = axis.get_status()
+    return ArmReading(
+        position=float(axis.get_position_calb().Position),
+        homed=bool(int(getattr(status, "Flags", 0)) & STATE_IS_HOMED),
+        moving=bool(int(status.MvCmdSts) & MVCMD_RUNNING),
+        speed=speed,
+    )
+
+
+def arm_angle(reading: ArmReading, large: bool, cfg: StageConfig) -> float:
+    """The receiver angle (large stage) or sample angle a reading means."""
+    if large:
+        return geometry.receiver_angle(reading.position, cfg.zero_l)
+    return geometry.sample_angle(reading.position, cfg.zero_s)
+
+
+class PositionReader:
+    """Reads both stages again and again from a background thread and keeps
+    the latest reading of each, so a window can show them without waiting
+    on the hardware. Only reads (status, position, speed): nothing it sends
+    moves a stage or changes a setting."""
+
+    def __init__(self, receiver_axis: Any, sample_axis: Any, period: float = 0.25) -> None:
+        self._axes = (receiver_axis, sample_axis)
+        self._period = period
+        self._lock = threading.Lock()
+        self._readings: list[ArmReading | None] = [None, None]
+        self._errors: list[str | None] = [None, None]
+        self._speeds = [read_speed(axis) for axis in self._axes]
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="position-reader", daemon=True)
+
+    def start(self) -> PositionReader:
+        self.read_now()
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def latest(self) -> tuple[list[ArmReading | None], list[str | None]]:
+        """([receiver, sample] readings, [receiver, sample] errors). A reading
+        stays at the last good one when a later read fails; the error says so."""
+        with self._lock:
+            return list(self._readings), list(self._errors)
+
+    def read_now(self) -> None:
+        for i, axis in enumerate(self._axes):
+            try:
+                reading, error = read_arm(axis, self._speeds[i]), None
+            except Exception as e:  # noqa: BLE001 -- shown to the person, and blocks going on
+                reading, error = None, f"{type(e).__name__}: {e}"
+            with self._lock:
+                if reading is not None:
+                    self._readings[i] = reading
+                self._errors[i] = error
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._period):
+            self.read_now()
+
+
+@contextmanager
+def open_stages_readonly(cfg: StageConfig) -> Iterator[tuple[Any, Any]]:
+    """Opens both stages to read them: calibration to degrees is set on the
+    library side only, and nothing is written to the controllers. Closes
+    them at the end. Raises HardwareUnavailable if either can't be opened."""
+    ximc = _load_ximc()
+    opened: list[Any] = []
+    try:
+        for uri, label, res in (
+            (cfg.device_uri_large, "large (receiver)", cfg.res_large),
+            (cfg.device_uri_small, "small (sample)", cfg.res_small),
+        ):
+            axis = _open_axis(ximc, uri, label)
+            opened.append(axis)
+            axis.set_calb(res, axis.get_engine_settings().MicrostepMode)
+        yield opened[0], opened[1]
+    finally:
+        for axis in opened:
+            try:
+                axis.close_device()
+            except Exception:  # noqa: BLE001, S110 -- nothing more to do with it
+                pass
+
+
+def format_readings(readings: list[ArmReading | None], errors: list[str | None], cfg: StageConfig) -> str:
+    """Both arms as text, for the terminal."""
+    lines = []
+    for name, reading, error, large in (
+        (RECEIVER, readings[0], errors[0], True),
+        (SAMPLE, readings[1], errors[1], False),
+    ):
+        if reading is None:
+            lines.append(f"  {name:<18}  could not be read: {error}")
+            continue
+        state = ("homed" if reading.homed else "NOT homed") + (", moving" if reading.moving else "")
+        lines.append(
+            f"  {name:<18}  {arm_angle(reading, large, cfg):8.2f}°   "
+            f"(controller at {reading.position:.2f}° from its zero; {state})"
+        )
+        if error:
+            lines.append(f"  {'':<18}  stopped answering: {error}")
+    if all(readings):
+        phi1, phi2 = geometry.phi_angles(arm_angle(readings[1], False, cfg), arm_angle(readings[0], True, cfg))
+        lines.append(f"  phi1 (incidence) {phi1:.2f}°, phi2 (receiver from the sample normal) {phi2:.2f}°")
+    if any(r is not None and not r.homed for r in readings):
+        lines.append(f"  {NOT_HOMED_NOTE}")
+    return "\n".join(lines)
 
 
 # -- live status from a running sweep -------------------------------------------------

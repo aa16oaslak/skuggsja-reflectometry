@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import gc
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -10,6 +15,7 @@ from . import clock, hardware, live_view, simulation, sweeps, toptica
 from . import config as cfgmod
 from .emergency_stop import run_with_emergency_stop
 from .hardware_window import HardwareCheckWindow
+from .position_window import PositionResult, PositionWindow
 from .stages import HardwareUnavailable, open_stages
 from .stop_window import StopWindowUnavailable
 
@@ -45,13 +51,39 @@ SIMULATE_OPTION = typer.Option(
 DEFAULT_SIM_SPEED = 20.0
 SPEED_OPTION = typer.Option(
     None, "--speed",
-    help=f"With --simulate: how many times faster than real time to run (default {DEFAULT_SIM_SPEED:g}).",
+    help=(
+        "How many times faster than real time simulations run: with --simulate, and the simulation "
+        f"before a real sweep (default {DEFAULT_SIM_SPEED:g})."
+    ),
 )
 SIM_OUTPUT_DIR = Path("reflecto_simulated")
 SKIP_CHECK_OPTION = typer.Option(
     False, "--skip-check",
     help="Start even if the hardware check before the sweep reports a problem. Only if you are sure the check is wrong.",
 )
+SKIP_PREVIEW_OPTION = typer.Option(
+    False, "--skip-preview",
+    help=(
+        "Real sweeps: go straight to the hardware, without first showing where the arms are and "
+        "simulating the sweep from there. Only once both have been checked."
+    ),
+)
+POSITION_TOLERANCE = 0.05  # degrees a stage may differ from where the simulation started it
+
+
+def _load_config(path: Path | None) -> cfgmod.AppConfig:
+    try:
+        return cfgmod.load_config(path)
+    except cfgmod.ConfigError as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(code=1) from None
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt).strip().lower()
+    except EOFError:  # no terminal to answer from
+        return ""
 
 
 @app.command()
@@ -61,12 +93,13 @@ def check(
     config: Path | None = CONFIG_OPTION,
 ) -> None:
     """Check that both stages and the TOptica are connected and ready. Reads status only: nothing moves."""
-    cfg = cfgmod.load_config(config)
+    cfg = _load_config(config)
     rig = simulation.SimRig(cfg) if simulate else None
     try:
         run_check = (lambda: hardware.check_simulated(rig)) if rig else (lambda: hardware.check_hardware(cfg))
         if gui:
             statuses = HardwareCheckWindow(run_check, hardware.unchecked(cfg, simulate, "checking...")).run()
+            gc.collect()  # free the window's Tk objects here, on the main thread
         else:
             statuses = run_check()
     except StopWindowUnavailable as e:
@@ -79,6 +112,62 @@ def check(
         raise typer.Exit(code=1)
     typer.echo(hardware.format_statuses(statuses))
     raise typer.Exit(code=0 if hardware.all_usable(statuses) else 1)
+
+
+@contextmanager
+def _readable_stages(cfg: cfgmod.AppConfig, simulated: bool) -> Iterator[tuple[Any, Any]]:
+    """Both stages, opened to be read without moving: the real ones, or a
+    simulated pair."""
+    if simulated:
+        rig = simulation.SimRig(cfg)
+        try:
+            yield rig.large, rig.small
+        finally:
+            rig.close()
+        return
+    try:
+        with hardware.open_stages_readonly(cfg.stages) as axes:
+            yield axes
+    except HardwareUnavailable as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(code=1) from None
+
+
+def _position_window(reader: hardware.PositionReader, cfg: cfgmod.AppConfig, config_path: Path | None, **kw: Any) -> PositionResult:
+    try:
+        window = PositionWindow(reader, cfg, cfgmod.settings_path(config_path), **kw)
+    except StopWindowUnavailable as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(code=1) from None
+    result = window.run()
+    # Free the closed window's Tk objects here, on the main thread, with the
+    # reader thread stopped first: Tk objects freed by a garbage collection
+    # on any other thread abort the whole process.
+    reader.stop()
+    del window
+    gc.collect()
+    return result
+
+
+@app.command()
+def position(
+    gui: bool = typer.Option(True, "--gui/--no-gui", help="Show the drawing (default), or just print the angles."),
+    simulate: bool = typer.Option(False, "--simulate", help="Read a simulated setup instead, e.g. to try the window."),
+    config: Path | None = CONFIG_OPTION,
+) -> None:
+    """Show where both arms are now, read from the stages without moving them. The drawing can be
+    mirrored and turned to match the table, and saved."""
+    cfg = _load_config(config)
+    with _readable_stages(cfg, simulate) as axes:
+        reader = hardware.PositionReader(*axes).start()
+        try:
+            if gui:
+                _position_window(reader, cfg, config, simulated=simulate)
+            else:
+                typer.echo("Where the arms are now (read from the stages; nothing moved):")
+                typer.echo(hardware.format_readings(*reader.latest(), cfg.stages))
+        finally:
+            reader.stop()
 
 
 def _preflight(run_check, cfg: cfgmod.AppConfig, skip: bool, simulated: bool) -> list[hardware.DeviceStatus]:
@@ -108,6 +197,62 @@ def _watch(axis) -> hardware.WatchedAxis:
     except Exception:  # noqa: BLE001, S110 -- shows as a red light, and the sweep's first move reports it too
         pass
     return watched
+
+
+def _confirm_positions(
+    cfg: cfgmod.AppConfig, config_path: Path | None, plan: list[sweeps.PlannedStep], title: str, gui: bool
+) -> tuple[tuple[hardware.ArmReading, hardware.ArmReading], cfgmod.AppConfig]:
+    """Step 1 of 3 before a real sweep: where the arms are, read without
+    moving them, and whether that matches the real setup. Returns the
+    readings and the config with the drawing as it was left; exits if the
+    person does not confirm."""
+    typer.echo("Step 1 of 3: where the arms are now (read only, nothing moves).")
+    with _readable_stages(cfg, simulated=False) as axes:
+        reader = hardware.PositionReader(*axes).start()
+        try:
+            if gui:
+                result = _position_window(
+                    reader, cfg, config_path, plan=plan, confirm=True,
+                    heading=f"Step 1 of 3 before: {title}\nDoes the drawing match the real arms?",
+                )
+            else:
+                readings, errors = reader.latest()
+                typer.echo(hardware.format_readings(readings, errors, cfg.stages))
+                usable = all(readings) and not any(errors)
+                if not usable:
+                    typer.echo("A stage could not be read, so where it is can't be confirmed.")
+                answer = _ask("Do these match the real arms? Type 'yes' to simulate the sweep from here: ") if usable else ""
+                result = PositionResult(answer == "yes", tuple(readings) if answer == "yes" else None, cfg.view)
+        finally:
+            reader.stop()
+    if not result.confirmed or result.readings is None:
+        typer.echo("Cancelled. Nothing was moved.")
+        raise typer.Exit(code=1)
+    for name, reading, large in (("Receiver", result.readings[0], True), ("Sample", result.readings[1], False)):
+        typer.echo(f"  {name} confirmed at {hardware.arm_angle(reading, large, cfg.stages):.2f}°.")
+    return result.readings, replace(cfg, view=result.view)
+
+
+def _stop_if_moved(large_stage, small_stage, start: tuple[hardware.ArmReading, hardware.ArmReading]) -> None:
+    """The simulation started where the arms were when they were confirmed.
+    If a stage has moved since, it no longer shows what this sweep will do."""
+    now = (large_stage.get_position_calb().Position, small_stage.get_position_calb().Position)
+    moved = [
+        f"{name} {before.position:.2f}° then, {after:.2f}° now (controller angles)"
+        for name, before, after in zip(("receiver", "sample"), start, now)
+        if abs(after - before.position) > POSITION_TOLERANCE
+    ]
+    if moved:
+        for axis in (large_stage, small_stage):
+            try:
+                axis.close_device()
+            except Exception:  # noqa: BLE001, S110 -- leaving anyway
+                pass
+        typer.echo(
+            "Error: a stage moved after its position was confirmed (" + "; ".join(moved) + "), so the "
+            "simulation no longer shows what this sweep will do. Nothing was moved; run the command again."
+        )
+        raise typer.Exit(code=1)
 
 
 @config_app.command("init")
@@ -140,16 +285,21 @@ def _run(
     simulate: bool,
     speed: float | None,
     skip_check: bool,
+    skip_preview: bool,
     config_path: Path | None,
 ) -> None:
-    if speed is not None and (not simulate or speed <= 0):
-        typer.echo("Error: --speed needs --simulate and a positive number.")
+    if speed is not None and (speed <= 0 or (skip_preview and not simulate)):
+        typer.echo(
+            "Error: --speed sets how fast simulations run (a positive number): with --simulate, or the "
+            "simulation before a real sweep, which --skip-preview leaves out."
+        )
         raise typer.Exit(code=1)
 
-    cfg = cfgmod.load_config(config_path)
+    cfg = _load_config(config_path)
     freq_start = cfg.scan_defaults.freq_start if freq_start is None else freq_start
     freq_stop = cfg.scan_defaults.freq_stop if freq_stop is None else freq_stop
     int_time = cfg.scan_defaults.int_time if int_time is None else int_time
+    speed = DEFAULT_SIM_SPEED if speed is None else speed
 
     try:
         # Fail on a filename collision before any hardware is opened; the
@@ -167,22 +317,32 @@ def _run(
     toptica.link.reset()  # fresh live status for this sweep
     toptica.progress.reset()
     plan = plan_fn(start_angle, end_angle, step)
+    sweep_args = (start_angle, end_angle, step, freq_start, freq_stop, int_time, filename, set_zero)
 
     if simulate:
-        _simulate(
-            sweep_fn, plan, title, cfg, start_angle, end_angle, step,
-            freq_start, freq_stop, int_time, filename, set_zero, gui,
-            DEFAULT_SIM_SPEED if speed is None else speed, skip_check,
-        )
+        _simulate(sweep_fn, plan, title, cfg, sweep_args, gui, speed, skip_check)
         return
 
     checked = _preflight(lambda: hardware.check_hardware(cfg), cfg, skip_check, simulated=False)
+
+    start = None
+    if not skip_preview:
+        start, cfg = _confirm_positions(cfg, config_path, plan, title, gui)
+        typer.echo("Step 2 of 3: the same sweep, simulated from where the arms are (nothing moves).")
+        if not _simulate(sweep_fn, plan, title, cfg, sweep_args, gui, speed, skip_check, start=start):
+            typer.echo("Cancelled. Nothing was moved.")
+            raise typer.Exit(code=1)
+        typer.echo("Step 3 of 3: the sweep on the real hardware.")
+        toptica.link.reset()
+        toptica.progress.reset()
 
     try:
         large_stage, small_stage = open_stages(cfg.stages)
     except HardwareUnavailable as e:
         typer.echo(f"Error: {e}")
         raise typer.Exit(code=1)
+    if start is not None:
+        _stop_if_moved(large_stage, small_stage, start)
 
     large, small = _watch(large_stage), _watch(small_stage)
     files = [s.output_file(filename, int_time, freq_start, freq_stop) for s in plan]
@@ -195,18 +355,11 @@ def _run(
             large,
             small,
             cfg,
-            start_angle,
-            end_angle,
-            step,
-            freq_start,
-            freq_stop,
-            int_time,
-            filename,
-            set_zero,
+            *sweep_args,
             overwrite,
             gui=gui,
             title=title,
-            window=live_view.live_window(source, plan, files, cfg.stages),
+            window=live_view.live_window(source, plan, files, cfg),
         )
     except (FileExistsError, StopWindowUnavailable) as e:
         typer.echo(f"Error: {e}")
@@ -218,34 +371,49 @@ def _simulate(
     plan: list[sweeps.PlannedStep],
     title: str,
     cfg: cfgmod.AppConfig,
-    start_angle: float,
-    end_angle: float,
-    step: float,
-    freq_start: float,
-    freq_stop: float,
-    int_time: float,
-    filename: str,
-    set_zero: bool,
+    sweep_args: tuple,
     gui: bool,
     speed: float,
     skip_check: bool,
-) -> None:
+    start: tuple[hardware.ArmReading, hardware.ArmReading] | None = None,
+) -> bool:
     """Runs the same sweep code against simulated stages and TOptica, and
-    prints planned-vs-actual angles for every step afterwards."""
-    typer.echo(
-        f"SIMULATION: no hardware is used. Stages and TOptica are simulated, time runs x{speed:g}, "
-        f"and the photocurrent is made up. Files go to {SIM_OUTPUT_DIR}/."
-    )
+    prints planned-vs-actual angles for every step afterwards.
+
+    With `start` (readings of the real stages) it is the simulation before a
+    real sweep: the simulated arms start where the real ones are, and at the
+    end the person is asked whether to run the sweep on the real hardware.
+    Returns that answer (False for a plain simulation)."""
+    before_real = start is not None
+    filename = sweep_args[6]
+    if before_real:
+        typer.echo(
+            f"The simulated arms start where the real ones are; time runs x{speed:g}; "
+            f"files go to {SIM_OUTPUT_DIR}/. Nothing moves yet."
+        )
+    else:
+        typer.echo(
+            f"SIMULATION: no hardware is used. Stages and TOptica are simulated, time runs x{speed:g}, "
+            f"and the photocurrent is made up. Files go to {SIM_OUTPUT_DIR}/."
+        )
     with clock.accelerated(speed):
-        rig = simulation.SimRig(cfg, SIM_OUTPUT_DIR)
+        rig = simulation.SimRig(cfg, SIM_OUTPUT_DIR, start=start)
         sim_filename = str(SIM_OUTPUT_DIR / filename)
+        freq_start, freq_stop, int_time = sweep_args[3:6]
         files = [s.output_file(sim_filename, int_time, freq_start, freq_stop) for s in plan]
+        window = None
         t0 = time.monotonic()
         ran = False
         try:
-            checked = _preflight(lambda: hardware.check_simulated(rig), cfg, skip_check, simulated=True)
+            if before_real:  # the real hardware was checked already; these only feed the lights
+                checked = hardware.check_simulated(rig)
+            else:
+                checked = _preflight(lambda: hardware.check_simulated(rig), cfg, skip_check, simulated=True)
             large, small = _watch(rig.large), _watch(rig.small)
             source = live_view.SweepSource(large, small, cfg.stages, checked, simulated=True)
+            window = live_view.live_window(
+                source, plan, files, cfg, verdict=(lambda: rig.verdict(plan)) if before_real else None
+            )
             run_with_emergency_stop(
                 sweep_fn,
                 [large, small],
@@ -253,27 +421,36 @@ def _simulate(
                 large,
                 small,
                 rig.cfg,
-                start_angle,
-                end_angle,
-                step,
-                freq_start,
-                freq_stop,
-                int_time,
+                *sweep_args[:6],
                 sim_filename,
-                set_zero,
+                sweep_args[7],
                 True,  # replace files from earlier simulations
                 gui=gui,
                 title=f"{title} (simulated)",
-                window=live_view.live_window(source, plan, files, cfg.stages),
+                window=window,
             )
             ran = True
         except StopWindowUnavailable as e:
             typer.echo(f"Error: {e}")
             raise typer.Exit(code=1)
+        except Exception as e:
+            if not before_real:
+                raise
+            typer.echo(f"\nThe simulated sweep failed: {type(e).__name__}: {e}")
+            typer.echo("The real sweep would fail the same way.")
         finally:
             rig.close()
             if ran or rig.toptica.scans or rig.large.moves or rig.small.moves:
                 typer.echo(rig.summary(plan, [Path(f) for f in files], time.monotonic() - t0))
+    if not before_real or not ran:
+        return False
+    if gui:
+        return bool(window and window.decision)
+    ok, lines = rig.verdict(plan)
+    typer.echo("\n".join(lines))
+    if not ok:
+        return False
+    return _ask("Type 'run' to send this sweep to the real hardware, anything else to cancel: ") == "run"
 
 
 @app.command()
@@ -295,13 +472,14 @@ def spec(
     simulate: bool = SIMULATE_OPTION,
     speed: float | None = SPEED_OPTION,
     skip_check: bool = SKIP_CHECK_OPTION,
+    skip_preview: bool = SKIP_PREVIEW_OPTION,
     config: Path | None = CONFIG_OPTION,
 ) -> None:
     """Run a specular (theta-2theta) reflectometry sweep."""
     title = f"Specular sweep: sample {start_angle}° to {end_angle}° in {step}° steps"
     _run(
         sweeps.sweep_spec, sweeps.plan_spec, title, start_angle, end_angle, step, freq_start, freq_stop,
-        int_time, filename, set_zero, overwrite, gui, simulate, speed, skip_check, config,
+        int_time, filename, set_zero, overwrite, gui, simulate, speed, skip_check, skip_preview, config,
     )
 
 
@@ -324,13 +502,14 @@ def nonspec(
     simulate: bool = SIMULATE_OPTION,
     speed: float | None = SPEED_OPTION,
     skip_check: bool = SKIP_CHECK_OPTION,
+    skip_preview: bool = SKIP_PREVIEW_OPTION,
     config: Path | None = CONFIG_OPTION,
 ) -> None:
     """Run a non-specular reflectometry sweep (receiver stage only)."""
     title = f"Non-specular sweep: receiver {start_angle}° to {end_angle}° in {step}° steps"
     _run(
         sweeps.sweep_nonspec, sweeps.plan_nonspec, title, start_angle, end_angle, step, freq_start, freq_stop,
-        int_time, filename, set_zero, overwrite, gui, simulate, speed, skip_check, config,
+        int_time, filename, set_zero, overwrite, gui, simulate, speed, skip_check, skip_preview, config,
     )
 
 

@@ -9,14 +9,10 @@ device_uri_large = 'xi-com:\\.\COM3'
 device_uri_small = 'xi-com:\\.\COM4'
 zero_l = 180.5      # degrees, zero for large rotation stage wrt home
 zero_s = -40         # degrees, zero for small rotation stage wrt home
-res_large = 0.0072   # degrees per microstep, large stage
-res_small = 0.015    # degrees per microstep, small stage
+res_large = 0.0072   # degrees per full motor step, large stage
+res_small = 0.015    # degrees per full motor step, small stage
 angle_min = 30       # degrees, soft limit
 angle_max = 180.0    # degrees, soft limit
-# Seen from above, the way the receiver moves away from Tx as its angle grows:
-# "counterclockwise" on this setup, "clockwise" in Fig. 1 of arXiv:2407.05512.
-# Only changes how the live view draws the setup, never which way a stage moves.
-receiver_turns = "counterclockwise"
 
 [toptica]
 host = "192.0.2.1"  # placeholder -- override in reflecto.toml with the real instrument address
@@ -35,3 +31,13 @@ stabilize_timeout = 30.0
 freq_start = 70
 freq_stop = 400
 int_time = 3
+
+[view]
+# How the live views draw the setup seen from above. Only the drawing:
+# nothing here changes which way or how far a stage moves.
+# The way the receiver moves away from Tx as its angle grows.
+receiver_turns = "clockwise"
+# Where Tx is drawn, in degrees counterclockwise from the right:
+# 0 right (as in Fig. 1 of arXiv:2407.05512), 90 up, 180 left, 270 down.
+# `reflecto position` turns the drawing to match your view and saves both.
+tx_direction = 0

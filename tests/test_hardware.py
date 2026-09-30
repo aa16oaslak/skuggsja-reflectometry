@@ -223,3 +223,82 @@ def test_live_status_falls_back_to_the_check_then_follows_the_sweep(rig):
 
     toptica.link.failed(ConnectionResetError("reset by peer"))
     assert source.devices()[2].state == FAIL
+
+
+# -- where the arms are, read without moving them --------------------------------------
+
+MOVING_OR_WRITING = ("move_calb", "movr_calb", "homezero", "stop")
+
+
+def test_open_stages_readonly_reads_and_closes_but_writes_nothing(cfg, monkeypatch):
+    axes = {cfg.stages.device_uri_large: FakeAxis(position=2.4), cfg.stages.device_uri_small: FakeAxis(position=188.73)}
+    fake_ximc(monkeypatch, lambda uri: axes[uri])
+    before_edges = [axis.edges for axis in axes.values()]
+
+    with hardware.open_stages_readonly(cfg.stages) as (large, small):
+        reader = hardware.PositionReader(large, small)
+        reader.read_now()
+        readings, errors = reader.latest()
+
+    assert [r.position for r in readings] == [2.4, 188.73]
+    assert errors == [None, None]
+    assert large.calibration == (cfg.stages.res_large, 9) and small.calibration == (cfg.stages.res_small, 9)
+    for axis, edges in zip(axes.values(), before_edges):
+        assert axis.calls[-1] == ("close",)
+        assert not any(call[0] in MOVING_OR_WRITING for call in axis.calls)
+        assert axis.edges is edges  # soft limits untouched
+
+
+def test_open_stages_readonly_closes_the_first_stage_if_the_second_fails(cfg, monkeypatch):
+    large = FakeAxis()
+
+    class Missing(FakeAxis):
+        def open_device(self):
+            raise ConnectionError("no such port")
+
+    fake_ximc(monkeypatch, lambda uri: large if uri == cfg.stages.device_uri_large else Missing())
+
+    with pytest.raises(hardware.HardwareUnavailable, match="small \\(sample\\)"), hardware.open_stages_readonly(cfg.stages):
+        pass
+
+    assert large.calls[-1] == ("close",)
+
+
+def test_reader_follows_the_arms_and_their_speeds(rig):
+    reader = hardware.PositionReader(rig.large, rig.small, period=0.01).start()
+    try:
+        with clock.accelerated(FAST):
+            rig.large.command_move_calb(rig.zero_l - 45)
+            while rig.large.moving:
+                clock.sleep(0.05)
+        reader.read_now()
+        (receiver, sample), errors = reader.latest()
+    finally:
+        reader.stop()
+
+    assert errors == [None, None]
+    assert hardware.arm_angle(receiver, True, rig.cfg.stages) == pytest.approx(45)
+    assert hardware.arm_angle(sample, False, rig.cfg.stages) == pytest.approx(simulation.START_SAMPLE_ANGLE)
+    assert (receiver.homed, receiver.moving) == (True, False)
+    assert (receiver.speed, sample.speed) == (simulation.RECEIVER_SPEED, simulation.SAMPLE_SPEED)
+
+
+def test_reader_keeps_the_last_good_reading_and_names_the_failure(rig):
+    reader = hardware.PositionReader(rig.large, rig.small)
+    reader.read_now()
+    rig.large.close_device()  # as if the cable were pulled
+
+    reader.read_now()
+    readings, errors = reader.latest()
+
+    assert readings[0] is not None
+    assert "not open" in errors[0] and errors[1] is None
+
+
+def test_format_readings_warns_about_stages_that_are_not_homed(cfg):
+    readings = [hardware.ArmReading(2.4, homed=False, moving=False), hardware.ArmReading(188.73, True, False)]
+
+    text = hardware.format_readings(readings, [None, None], cfg.stages)
+
+    assert "178.10°" in text and "228.73°" in text
+    assert "NOT homed" in text and "--set-zero" in text

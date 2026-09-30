@@ -14,6 +14,7 @@ import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from . import clock, geometry
 from .config import AppConfig, TopticaConfig
@@ -26,7 +27,10 @@ from .stages import (
 )
 from .sweeps import PlannedStep
 
-# Guesses: the real speeds come from settings stored in the stage controllers.
+if TYPE_CHECKING:
+    from .hardware import ArmReading
+
+# Guesses, used unless real readings give the speeds stored in the controllers.
 RECEIVER_SPEED = 5.0  # degrees per second
 SAMPLE_SPEED = 10.0
 # Where the simulated stages "were left" before the run, in degrees.
@@ -129,6 +133,9 @@ class SimAxis:
     def get_move_settings(self) -> SimpleNamespace:
         return SimpleNamespace(**vars(self._move_settings))
 
+    def get_move_settings_calb(self) -> SimpleNamespace:
+        return SimpleNamespace(Speed=self.speed, Accel=0.0, Decel=0.0, AntiplaySpeed=0.0, MoveFlags=0)
+
     def set_move_settings(self, settings) -> None:
         self._move_settings = SimpleNamespace(**vars(settings))
 
@@ -143,7 +150,7 @@ class SimAxis:
         with self._lock:
             now = clock.time()
             sts = MVCMD_RUNNING if now < self._t_end else 0
-            if self._error:
+            if self._error and now >= self._t_end:  # flagged once the stage is at the limit, not before
                 sts |= MVCMD_ERROR
             usteps = round(self._position_at(now) / self._calb * 256)
             flags = STATE_IS_HOMED if self.homed else 0
@@ -169,6 +176,8 @@ class SimAxis:
         with self._lock:
             now = clock.time()
             here = self._position_at(now)
+            if now < self._t_end:
+                self._error = False  # stopped before reaching any limit
             self._start = self._target = here
             self._t_start = self._t_end = now
             self._stop_requested = True
@@ -307,13 +316,25 @@ class SimRig:
     """Both simulated stages, calibrated and limited exactly like the real
     ones from the same config, plus the simulated TOptica. `cfg` is the
     config to run the sweep with: identical, except the TOptica address
-    points at the simulator."""
+    points at the simulator.
 
-    def __init__(self, cfg: AppConfig, output_dir: Path | None = None) -> None:
+    `start` is (receiver, sample) readings of the real stages to start
+    from -- position, homed or not, and speed where it was read; without
+    it the stages start at START_RECEIVER_ANGLE and START_SAMPLE_ANGLE."""
+
+    def __init__(
+        self, cfg: AppConfig, output_dir: Path | None = None, start: tuple[ArmReading, ArmReading] | None = None
+    ) -> None:
         st = cfg.stages
         self.zero_l, self.zero_s = st.zero_l, st.zero_s
-        self.large = SimAxis("receiver", RECEIVER_SPEED, st.zero_l - START_RECEIVER_ANGLE)
-        self.small = SimAxis("sample", SAMPLE_SPEED, START_SAMPLE_ANGLE + st.zero_s)
+        if start is None:
+            self.large = SimAxis("receiver", RECEIVER_SPEED, st.zero_l - START_RECEIVER_ANGLE)
+            self.small = SimAxis("sample", SAMPLE_SPEED, START_SAMPLE_ANGLE + st.zero_s)
+        else:
+            self.large = SimAxis("receiver", start[0].speed or RECEIVER_SPEED, start[0].position)
+            self.small = SimAxis("sample", start[1].speed or SAMPLE_SPEED, start[1].position)
+            self.large.homed, self.small.homed = start[0].homed, start[1].homed
+        self.speeds_read = start is not None and all(reading.speed for reading in start)
         for axis in (self.large, self.small):
             axis.open_device()
         configure_stages(self.large, self.small, st)
@@ -352,7 +373,7 @@ class SimRig:
                 rows.append(f"{k + 1:>2}/{len(plan):<2}  {planned}  not reached (the sweep ended early)")
                 continue
             scan = self.toptica.scans[k]
-            ok = abs(scan.sample - step.sample) < 0.01 and abs(scan.receiver - step.receiver) < 0.01
+            ok = _as_planned(scan, step)
             mismatches += not ok
             phi1, phi2 = geometry.phi_angles(scan.sample, scan.receiver)
             saved = _data_lines(path)
@@ -363,23 +384,53 @@ class SimRig:
         rows.append("")
         if mismatches:
             rows.append(f"XX {mismatches} step(s) scanned at different angles than planned.")
+        rows.extend(f"!! {hit}" for hit in self._border_hits())
+        sim_seconds = clock.time() - self.t_start
+        rows.append(
+            f"Stage moves: receiver {self.large.moves}, sample {self.small.moves}. "
+            f"Estimated time on the setup: {clock.hms(sim_seconds)} "
+            f"(simulated in {clock.hms(real_seconds)}, x{clock.speed():g}; stage speeds "
+            f"{'read from the controllers' if self.speeds_read else 'guessed'})."
+        )
+        rows.append(f"Simulated data (fake photocurrent) is in {self.output_dir}/")
+        return "\n".join(rows)
+
+    def verdict(self, plan: list[PlannedStep]) -> tuple[bool, list[str]]:
+        """Whether the simulated sweep went as planned, in a few lines for
+        the person deciding whether to run it on the real hardware."""
+        scans = self.toptica.scans
+        reached = min(len(scans), len(plan))
+        off = [k + 1 for k in range(reached) if not _as_planned(scans[k], plan[k])]
+        ok = reached == len(plan) and not off
+        lines = [f"All {len(plan)} steps were scanned at the planned angles."] if ok else []
+        if off:
+            lines.append(f"Step {', '.join(map(str, off))} scanned at other angles than planned.")
+        if reached < len(plan):
+            lines.append(f"Only {reached} of {len(plan)} steps were reached.")
+        lines.extend(self._border_hits())
+        lines.append(
+            f"Estimated time on the setup: {clock.hms(clock.time() - self.t_start)} "
+            f"(stage speeds {'read from the controllers' if self.speeds_read else 'guessed'})."
+        )
+        return ok, lines
+
+    def _border_hits(self) -> list[str]:
+        counts: dict[str, int] = {}
         for axis, to_angle in (
             (self.large, lambda p: geometry.receiver_angle(p, self.zero_l)),
             (self.small, lambda p: geometry.sample_angle(p, self.zero_s)),
         ):
             for target, stopped in axis.border_hits:
-                rows.append(
-                    f"!! {axis.label} move to {to_angle(target):.4f}° stopped at the soft limit, "
-                    f"{to_angle(stopped):.4f}°."
+                hit = (
+                    f"The {axis.label} move to {to_angle(target):.4f}° stopped at the soft limit, "
+                    f"{to_angle(stopped):.4f}°"
                 )
-        sim_seconds = clock.time() - self.t_start
-        rows.append(
-            f"Stage moves: receiver {self.large.moves}, sample {self.small.moves}. "
-            f"Estimated time on the setup: {clock.hms(sim_seconds)} "
-            f"(simulated in {clock.hms(real_seconds)}, x{clock.speed():g})."
-        )
-        rows.append(f"Simulated data (fake photocurrent) is in {self.output_dir}/")
-        return "\n".join(rows)
+                counts[hit] = counts.get(hit, 0) + 1
+        return [f"{hit} ({'twice' if n == 2 else f'{n} times'})." if n > 1 else f"{hit}." for hit, n in counts.items()]
+
+
+def _as_planned(scan: SimScan, step: PlannedStep) -> bool:
+    return abs(scan.sample - step.sample) < 0.01 and abs(scan.receiver - step.receiver) < 0.01
 
 
 def _data_lines(path: Path) -> int | None:

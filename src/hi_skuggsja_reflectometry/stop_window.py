@@ -83,11 +83,12 @@ class StopWindow:
         )
         self.button.pack(fill="both", expand=True, padx=16, pady=6, ipady=18)
 
-        tk.Label(
+        self.hint = tk.Label(
             self.controls,
             text="Esc also stops while this window is focused.\nClosing this window stops the sweep.",
             font=("Helvetica", 9),
-        ).pack(padx=16, pady=(6, 14))
+        )
+        self.hint.pack(padx=16, pady=(6, 14))
 
         self.root.bind("<Escape>", lambda _event: self._stop("Esc in stop window"))
         self.root.protocol("WM_DELETE_WINDOW", lambda: self._stop("stop window closed"))

@@ -66,12 +66,15 @@ reflecto config init
 This writes `reflecto.toml`. Edit only the keys you need to
 change -- anything you don't set falls back to the packaged default. If you
 run commands from a different folder, point at it explicitly with
-`--config path\to\reflecto.toml`.
+`--config path\to\reflecto.toml`. A mistyped setting is reported by name
+instead of being ignored.
 
-`receiver_turns` under `[stages]` says which way the live view draws the
-receiver moving away from Tx, seen from above: `"counterclockwise"` on this
-setup (the default), `"clockwise"` as in Fig. 1 of arXiv:2407.05512. It only
-changes the drawing, never which way a stage moves.
+The `[view]` section only changes how the setup is drawn, never how a stage
+moves: `receiver_turns` is the way the receiver moves away from Tx as its
+angle grows, seen from above (`"clockwise"`, as in Fig. 1 of
+arXiv:2407.05512), and `tx_direction` is where Tx is drawn, in degrees
+counterclockwise from the right (0 right, 90 up, 180 left, 270 down).
+`reflecto position` sets both against the real arms and saves them.
 
 ## Check the hardware
 
@@ -91,6 +94,32 @@ setting changes.
 `--no-gui` just prints the result (exit code 0 if everything is usable, 1
 if not), and `--simulate` checks a simulated setup, e.g. to see the window.
 
+## See where the arms are
+
+```powershell
+reflecto position
+```
+
+Opens a window that draws both arms where the stages say they are, read
+from the controllers every quarter of a second without moving anything:
+Tx, the receiver on its ring, the sample and its normal, and the angles.
+Next to it are both angles, the controller positions, and whether each
+stage has been homed since it was switched on.
+
+Stand where you can see the table and make the drawing look like it:
+**Mirror** swaps the direction the angles grow, **Turn** rotates the drawing
+in 15° or 90° steps, and **Save** writes both into the `[view]` section of
+`reflecto.toml`. Then check:
+
+- Tx, the receiver and the sample plate should all sit where they are on
+  the table. If the receiver or the sample is somewhere else, the angles
+  themselves are wrong: a stage that is not homed only counts steps from
+  wherever it was when switched on. Home the stages with `--set-zero`.
+- After homing, the receiver should be at its home, almost opposite Tx.
+
+`--no-gui` prints the angles instead, and `--simulate` shows a simulated
+setup, e.g. to try the window.
+
 ## Run a sweep
 
 ```powershell
@@ -108,6 +137,26 @@ Every sweep starts with the same hardware check as `reflecto check`, printed
 in the terminal. If a device is not usable, the sweep stops there, before
 anything has moved. (`--skip-check` starts anyway, for the case where you
 are sure the check itself is wrong.)
+
+A real sweep then goes through three steps, and nothing moves before the
+third:
+
+1. **Where the arms are.** The `reflecto position` window, with the angles
+   this sweep will visit marked on the ring. Press *The drawing matches the
+   setup* only if it does; *Cancel* ends the run.
+2. **The same sweep, simulated from there.** The simulated arms start
+   exactly where the real ones are (at the speeds stored in the
+   controllers) and run the whole sweep, 20x faster (`--speed` to change
+   it), so you can watch every move before it happens. At the end the window
+   says whether every step reached its planned angles and asks *Run on the
+   real hardware* or *Cancel*. A sweep that fails in the simulation, for
+   example because it would pass a soft limit, is not offered.
+3. **The real sweep**, as below. If a stage has moved since step 1, it stops
+   instead, because the simulation no longer shows what would happen.
+
+With `--no-gui` the same steps are asked in the terminal (type `yes`, then
+`run`). `--skip-preview` goes straight to step 3; use it only once both the
+drawing and the sweep have been checked.
 
 While a sweep runs, an always-on-top window shows the setup from above, like
 Fig. 1 of [arXiv:2407.05512](https://arxiv.org/abs/2407.05512) (see *Test a
