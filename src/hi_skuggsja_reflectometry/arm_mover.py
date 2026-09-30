@@ -8,7 +8,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING, Any
 
-from . import clock
+from . import clock, geometry
 from .hardware import ArmReading, arm_angle
 from .stages import MVCMD_ERROR, MVCMD_RUNNING, RECEIVER, SAMPLE, STAGE_LABELS
 
@@ -89,7 +89,7 @@ class ArmMover:
             elif int(status.MvCmdSts) & MVCMD_ERROR:
                 message, ok = f"{label}: the controller ended the move early (at a soft limit?).", False
             else:
-                message = f"{label}: moved {delta:+g}° (to {target:.2f}°)."
+                message = f"{label}: moved {delta:+g}° (to {geometry.within_turn(target):.2f}°)."
         except Exception as e:  # noqa: BLE001 -- shown in the window; the stage is stopped
             message, ok = f"{label}: move failed ({type(e).__name__}: {e}). Stopped.", False
             try:

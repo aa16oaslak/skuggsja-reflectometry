@@ -152,8 +152,9 @@ class SetupDrawing:
         if sample is not None:
             # sample normal, the sample on R2 perpendicular to it, and phi1
             cv.create_line(c, c, *self._xy(sample, R - 12), fill=_NORMAL, dash=(6, 4))
-            self._arc(55, 0, sample, outline=_SAMPLE)
-            self._label(sample / 2, 62, f"φ1 {sample:.1f}°", fill=_SAMPLE, font=("Helvetica", 9))
+            phi1 = geometry.signed(sample)  # the short way round from Tx
+            self._arc(55, 0, phi1, outline=_SAMPLE)
+            self._label(phi1 / 2, 62, f"φ1 {phi1:.1f}°", fill=_SAMPLE, font=("Helvetica", 9))
             (x0, y0), (x1, y1) = self._xy(sample + 90, 42), self._xy(sample - 90, 42)
             cv.create_line(x0, y0, x1, y1, fill=_SAMPLE, width=6)
             self._label(sample - 90, 48, "Sample (R2)", fill=_SAMPLE, font=("Helvetica", 9, "bold"))
@@ -166,8 +167,9 @@ class SetupDrawing:
                 self._box(2 * sample, R, 10, fill="", outline=_GHOST, width=2)
                 gx, gy = self._xy(2 * sample, R - 28)
                 cv.create_text(gx, gy, text="specular", fill=_GHOST, font=("Helvetica", 8))
-            self._arc(80, sample, receiver, outline=_SAMPLE)
-            self._label((sample + receiver) / 2, 87, f"φ2 {receiver - sample:.1f}°", fill=_SAMPLE, font=("Helvetica", 9))
+            _, phi2 = geometry.phi_angles(sample, receiver)  # the short way round from the normal
+            self._arc(80, sample, sample + phi2, outline=_SAMPLE)
+            self._label(sample + phi2 / 2, 87, f"φ2 {phi2:.1f}°", fill=_SAMPLE, font=("Helvetica", 9))
 
         if receiver is not None:
             cv.create_line(c, c, *self._xy(receiver, R), fill=_BEAM, width=2)
@@ -374,7 +376,10 @@ class LiveSweepWindow(StopWindow):
             warnings.append(f"Receiver at {receiver:.2f}°, outside the soft limits {lo:g}°-{hi:g}°.")
         if (
             scan.active and planned and sample is not None and receiver is not None
-            and (abs(sample - planned.sample) > 0.01 or abs(receiver - planned.receiver) > 0.01)
+            and (
+                abs(geometry.angle_between(sample, planned.sample)) > 0.01
+                or abs(geometry.angle_between(receiver, planned.receiver)) > 0.01
+            )
         ):
             warnings.append("Scanning at different angles than planned for this step.")
         if any(not lo <= step.receiver <= hi for step in self._plan):

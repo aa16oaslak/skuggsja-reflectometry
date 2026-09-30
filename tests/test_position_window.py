@@ -314,3 +314,32 @@ def test_the_step_before_a_sweep_offers_no_moves(open_window):
         assert window.banner.cget("text") == "READ ONLY - nothing moves"
     finally:
         window.root.destroy()
+
+
+def test_phi_angles_stay_within_a_turn_when_the_sample_count_passes_one(cfg, tmp_path):
+    from hi_skuggsja_reflectometry import simulation
+    from hi_skuggsja_reflectometry.hardware import ArmReading
+
+    # the lab screenshot: sample count 341.53 (= 381.53°), receiver at 112.09°
+    rig = simulation.SimRig(cfg, start=(ArmReading(68.41, False, False), ArmReading(341.53, False, False)))
+    reader = hardware.PositionReader(rig.large, rig.small).start()
+    try:
+        window = PositionWindow(reader, cfg, tmp_path / "reflecto.toml")
+    except StopWindowUnavailable as exc:
+        reader.stop()
+        rig.close()
+        pytest.skip(f"no display for Tk: {exc}")
+    try:
+        text = window.readout.cget("text")
+        canvas = window.drawing.canvas
+        extents = [float(canvas.itemcget(item, "extent")) for item in canvas.find_all() if canvas.type(item) == "arc"]
+        labels = [canvas.itemcget(item, "text") for item in canvas.find_all() if canvas.type(item) == "text"]
+    finally:
+        window.root.destroy()
+        reader.stop()
+        rig.close()
+
+    assert "Sample R2       21.53°" in text and "at 341.53°" in text  # the angle within a turn, the raw count too
+    assert "φ1 incidence    21.53°" in text and "φ2 receiver     90.56°" in text
+    assert "φ1 21.5°" in labels and "φ2 90.6°" in labels
+    assert extents and all(abs(e) <= 180 for e in extents)  # no arc goes more than half way round

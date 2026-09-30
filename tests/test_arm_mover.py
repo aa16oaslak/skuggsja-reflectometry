@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from hi_skuggsja_reflectometry import clock, hardware
+from hi_skuggsja_reflectometry import clock, geometry, hardware
 from hi_skuggsja_reflectometry.arm_mover import ArmMover
 from hi_skuggsja_reflectometry.stages import RECEIVER, SAMPLE
 from tests.conftest import FAST
@@ -32,10 +32,11 @@ def test_moves_an_arm_by_that_many_degrees_of_its_angle(rig, stage, delta):
         wait_done(mover)
 
     sample, receiver = rig.angles()
+    turned = geometry.angle_between  # angles are kept within one turn: 0° - 3° reads 357°
     if stage == RECEIVER:
-        assert (receiver - before[1], sample) == (pytest.approx(delta), pytest.approx(before[0]))
+        assert (turned(receiver, before[1]), sample) == (pytest.approx(delta), pytest.approx(before[0]))
     else:
-        assert (sample - before[0], receiver) == (pytest.approx(delta), pytest.approx(before[1]))
+        assert (turned(sample, before[0]), receiver) == (pytest.approx(delta), pytest.approx(before[1]))
     busy, message, ok = mover.state()
     assert busy is None and ok and f"moved {delta:+g}°" in message
 

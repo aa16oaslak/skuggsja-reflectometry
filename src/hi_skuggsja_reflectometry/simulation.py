@@ -468,7 +468,10 @@ class SimRig:
 
 
 def _as_planned(scan: SimScan, step: PlannedStep) -> bool:
-    return abs(scan.sample - step.sample) < 0.01 and abs(scan.receiver - step.receiver) < 0.01
+    return (
+        abs(geometry.angle_between(scan.sample, step.sample)) < 0.01
+        and abs(geometry.angle_between(scan.receiver, step.receiver)) < 0.01
+    )
 
 
 def _data_lines(path: Path) -> int | None:
