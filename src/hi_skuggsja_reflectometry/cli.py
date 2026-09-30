@@ -25,9 +25,11 @@ from .stages import (
     SAMPLE,
     STAGE_LABELS,
     HardwareUnavailable,
+    describe_homing,
     home_stages,
     homing_direction,
     open_stages,
+    port_name,
 )
 from .stop_window import StopWindowUnavailable
 
@@ -193,7 +195,7 @@ def position(
 
 
 def _confirm_homing(
-    stages: list[str], readings: list[hardware.ArmReading], directions: dict[str, int | None], cfg: cfgmod.AppConfig
+    stages: list[str], readings: list[hardware.ArmReading], about: dict[str, dict[str, Any]], cfg: cfgmod.AppConfig
 ) -> bool:
     """Says what homing will do, and asks for 'clear' before anything moves."""
     order = [s for s in HOMING_ORDER if s in stages]
@@ -205,7 +207,7 @@ def _confirm_homing(
     for stage in order:
         large = stage == RECEIVER
         reading = readings[0 if large else 1]
-        d = directions.get(stage)
+        d = about[stage]["direction"]
         if d is None:
             way = "in a direction that could not be read from its controller"
         else:
@@ -215,9 +217,12 @@ def _confirm_homing(
                 f"(as when a sweep moves it to a {'larger' if grows else 'smaller'} angle)"
             )
         state = "homed" if reading.homed else "NOT homed, so this angle may be wrong"
+        port = port_name(cfg.stages.device_uri_large if large else cfg.stages.device_uri_small)
         typer.echo(
-            f"  {STAGE_LABELS[stage]:<12} now at {hardware.arm_angle(reading, large, cfg.stages):.2f}° ({state}).\n"
-            f"  {'':<12} Homing starts turning {way}."
+            f"  {STAGE_LABELS[stage]:<12} on {port}, controller serial {about[stage]['serial']}: now at "
+            f"{hardware.arm_angle(reading, large, cfg.stages):.2f}° ({state}).\n"
+            f"  {'':<12} Homing starts turning {way}.\n"
+            f"  {'':<12} Its controller homes {about[stage]['homing'] or '(settings could not be read)'}."
         )
     typer.echo(
         "Check that the whole way round in those directions is free: cables, the micrometer and mounts on the "
@@ -226,9 +231,18 @@ def _confirm_homing(
     return _ask("Type 'clear' to home, anything else to cancel: ") == "clear"
 
 
-def _read_for_homing(large: Any, small: Any) -> tuple[list[hardware.ArmReading], dict[str, int | None]]:
+def _read_for_homing(large: Any, small: Any) -> tuple[list[hardware.ArmReading], dict[str, dict[str, Any]]]:
+    """Where the stages are, and what their controllers say about homing
+    and who they are: read only."""
     readings = [hardware.read_arm(large), hardware.read_arm(small)]
-    return readings, {RECEIVER: homing_direction(large), SAMPLE: homing_direction(small)}
+    about = {}
+    for stage, axis in ((RECEIVER, large), (SAMPLE, small)):
+        try:
+            serial: Any = axis.get_serial_number()
+        except Exception:  # noqa: BLE001 -- only shown
+            serial = "unknown"
+        about[stage] = {"direction": homing_direction(axis), "homing": describe_homing(axis), "serial": serial}
+    return readings, about
 
 
 class HomeStages(str, Enum):
@@ -266,8 +280,8 @@ def homing(
             if not simulate:
                 _preflight(lambda: hardware.check_stages(cfg), cfg, skip_check, simulated=False)
             with _readable_stages(cfg, simulate, rig) as axes:
-                readings, directions = _read_for_homing(*axes)
-            if not _confirm_homing(to_home, readings, directions, cfg):
+                readings, about = _read_for_homing(*axes)
+            if not _confirm_homing(to_home, readings, about, cfg):
                 typer.echo("Cancelled. Nothing was moved.")
                 raise typer.Exit(code=1)
 
@@ -512,8 +526,8 @@ def _run(
     if start is not None:
         _stop_if_moved(large_stage, small_stage, start)
     if set_zero:
-        readings, directions = _read_for_homing(large_stage, small_stage)
-        if not _confirm_homing(list(HOMING_ORDER), readings, directions, cfg):
+        readings, about = _read_for_homing(large_stage, small_stage)
+        if not _confirm_homing(list(HOMING_ORDER), readings, about, cfg):
             for axis in (large_stage, small_stage):
                 try:
                     axis.close_device()

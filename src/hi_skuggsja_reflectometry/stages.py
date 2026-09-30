@@ -16,6 +16,13 @@ if TYPE_CHECKING:
 # libximc accepts plain ints for these and reports status as int flags.
 MVCMD_ERROR = 0x40  # MvcmdStatus.MVCMD_ERROR
 MVCMD_RUNNING = 0x80  # MvcmdStatus.MVCMD_RUNNING
+MVCMD_NAME_BITS = 0x3F  # which command the move status is about
+MVCMD_MOVE, MVCMD_MOVR, MVCMD_STOP, MVCMD_HOME = 0x01, 0x02, 0x05, 0x06
+_COMMAND_NAMES = {
+    0x00: "none", 0x01: "move", 0x02: "relative move", 0x03: "turn left", 0x04: "turn right",
+    0x05: "stop", 0x06: "home", 0x07: "loft", 0x08: "soft stop",
+}
+HOME_START_TIMEOUT = 2.0  # seconds for the controller to take up a home command
 BORDER_IS_ENCODER = 0x01  # borders are the LeftBorder/RightBorder positions, not limit switches
 BORDER_STOP_LEFT = 0x02
 BORDER_STOP_RIGHT = 0x04
@@ -147,6 +154,37 @@ def position(axis: ximc.Axis, large: bool, zero_l: float, zero_s: float) -> floa
         return int(axis.get_position_calb().Position) - zero_s
 
 
+def describe_move_status(sts: int) -> str:
+    """The controller's move status (MvCmdSts) in words."""
+    name = _COMMAND_NAMES.get(sts & MVCMD_NAME_BITS, f"command {sts & MVCMD_NAME_BITS:#04x}")
+    parts = [f"last command {name}"]
+    if sts & MVCMD_RUNNING:
+        parts.append("running")
+    if sts & MVCMD_ERROR:
+        parts.append("ended with an error")
+    return ", ".join(parts) + f" (MvCmdSts {sts:#04x})"
+
+
+def describe_homing(axis: Any) -> str | None:
+    """The controller's own homing settings in words, or None if they can't
+    be read."""
+    try:
+        settings = axis.get_home_settings()
+        flags = int(settings.HomeFlags)
+    except Exception:  # noqa: BLE001 -- only shown to the person
+        return None
+    until = {0: "nothing (no stop condition set)", 1: "its revolution sensor", 2: "its sync input", 3: "a limit switch"}
+    parts = [f"first towards {'increasing' if flags & 0x01 else 'decreasing'} counts until {until[(flags >> 4) & 3]}"]
+    if flags & 0x04:
+        parts.append(f"then towards {'increasing' if flags & 0x02 else 'decreasing'} counts until {until[(flags >> 6) & 3]}")
+    delta = getattr(settings, "HomeDelta", None)
+    if delta:
+        parts.append(f"then {delta} steps further")
+    fast = getattr(settings, "FastHome", None)
+    speed = f", at {fast} steps/s" if fast is not None else ""
+    return "; ".join(parts) + speed + f" (HomeFlags {flags:#05x})"
+
+
 def homing_direction(axis: Any) -> int | None:
     """Which way the controller's own homing starts: +1 towards increasing
     counts, -1 towards decreasing, None if its settings can't be read."""
@@ -162,45 +200,79 @@ def home_stage(axis: Any, stage: str, cfg: StageConfig, stop_event: threading.Ev
     procedure (its direction and speeds are set in the controller), and
     only when the controller reports it homed, sets its count to 0 there.
 
-    For the receiver, stopping at the soft limits is switched off while it
-    homes: the limits are counted from a zero that is only right once it is
-    homed. They are set again, now in the right place, straight after.
+    Stopping at soft limits is switched off while a stage homes: limits are
+    counted from a zero that is only right once it is homed, so before that
+    they could stop it anywhere. The receiver gets its limits again, now in
+    the right place, straight after; the sample's controller gets back what
+    it had.
 
     Raises RuntimeError if a stop interrupts it or the controller does not
-    report the stage homed; the count is then left alone, not zeroed."""
+    report the stage homed, saying what the controller reported; the count
+    is then left alone, not zeroed."""
     label = STAGE_LABELS[stage]
     if stop_event.is_set():
         raise RuntimeError(f"[{label}] emergency stop before homing")
 
-    edges, original_flags = None, None
-    if stage == RECEIVER:
-        edges = axis.get_edges_settings()
-        original_flags = int(edges.BorderFlags)
+    edges = axis.get_edges_settings()
+    original_flags = int(edges.BorderFlags)
+    if original_flags & (BORDER_STOP_LEFT | BORDER_STOP_RIGHT):
         edges.BorderFlags = original_flags & ~(BORDER_STOP_LEFT | BORDER_STOP_RIGHT)
         axis.set_edges_settings(edges)
 
     homed = False
     try:
         print(f"  [{label}] homing...")
+        start = float(axis.get_position_calb().Position)
         axis.command_home()
+        _wait_for_home_to_start(axis, label, stop_event, poll_ms)
         try:
             wait_for_stop(axis, stop_event, poll_ms)
         except RuntimeError:
             raise RuntimeError(f"[{label}] homing was stopped before it finished; not homed") from None
         status = axis.get_status()
-        if int(status.MvCmdSts) & MVCMD_ERROR or not int(getattr(status, "Flags", 0)) & STATE_IS_HOMED:
-            raise RuntimeError(f"[{label}] the controller did not report the stage homed; its count was left alone")
+        sts, flags = int(status.MvCmdSts), int(getattr(status, "Flags", 0))
+        if sts & MVCMD_ERROR or not flags & STATE_IS_HOMED:
+            moved = float(axis.get_position_calb().Position) - start
+            raise RuntimeError(_homing_failure(label, sts, moved, axis))
         axis.command_zero()
         homed = True
     finally:
-        if edges is not None:
-            if homed:
-                set_boundaries(axis, cfg.res_large, cfg.angle_min, cfg.angle_max, cfg.zero_l)
-            else:
-                edges.BorderFlags = original_flags
-                axis.set_edges_settings(edges)
+        if stage == RECEIVER and homed:
+            set_boundaries(axis, cfg.res_large, cfg.angle_min, cfg.angle_max, cfg.zero_l)
+        elif int(edges.BorderFlags) != original_flags:
+            edges.BorderFlags = original_flags
+            axis.set_edges_settings(edges)
     home_angle = cfg.zero_l if stage == RECEIVER else -cfg.zero_s
     print(f"  [{label}] homed ✓ (count 0 = {home_angle:g}° in the settings)")
+
+
+def _wait_for_home_to_start(axis: Any, label: str, stop_event: threading.Event, poll_ms: int) -> None:
+    """Waits until the controller's move status is about the home command,
+    so a status left over from before is not taken for the end of homing."""
+    deadline = clock.time() + HOME_START_TIMEOUT
+    while True:
+        sts = int(axis.get_status().MvCmdSts)
+        if sts & MVCMD_NAME_BITS == MVCMD_HOME:
+            return
+        if stop_event.is_set():
+            axis.command_stop()
+            raise RuntimeError(f"[{label}] homing was stopped before it finished; not homed")
+        if clock.time() > deadline:
+            axis.command_stop()
+            raise RuntimeError(
+                f"[{label}] the controller did not take up the home command ({describe_move_status(sts)}); "
+                "not homed, its count was left alone"
+            )
+        clock.sleep(poll_ms / 1000)
+
+
+def _homing_failure(label: str, sts: int, moved: float, axis: Any) -> str:
+    how = "it did not move at all" if abs(moved) < 0.01 else f"it moved {moved:+.2f}° in the settings' units first"
+    return (
+        f"[{label}] homing ended without the controller reporting the stage homed; {how}. Its count was "
+        f"left alone. Controller: {describe_move_status(sts)}. Its homing settings: "
+        f"{describe_homing(axis) or 'could not be read'}."
+    )
 
 
 def home_stages(

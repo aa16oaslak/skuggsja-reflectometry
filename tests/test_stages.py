@@ -205,11 +205,77 @@ def test_home_stage_does_not_zero_if_the_controller_does_not_report_homed():
     axis = NeverHomed(position=150.49)
     axis.edges.BorderFlags = 0x07
 
-    with pytest.raises(RuntimeError, match="did not report the stage homed"):
+    with pytest.raises(RuntimeError, match="without the controller reporting the stage homed") as failure:
         stages.home_stage(axis, stages.RECEIVER, stage_cfg(), threading.Event())
 
     assert ("zero",) not in axis.calls
     assert int(axis.edges.BorderFlags) == 0x07
+    assert "last command home" in str(failure.value)
+    assert "until its revolution sensor" in str(failure.value)
+
+
+def test_a_homing_that_does_not_move_says_so():
+    class EndsAtOnce(FakeAxis):
+        def command_home(self):  # the controller takes the command but ends it with an error at once
+            self.calls.append(("home",))
+            self.command = 0x06 | 0x40
+
+    axis = EndsAtOnce(position=108.57)
+
+    with pytest.raises(RuntimeError) as failure:
+        stages.home_stage(axis, stages.SAMPLE, stage_cfg(), threading.Event())
+
+    message = str(failure.value)
+    assert "it did not move at all" in message and "ended with an error" in message
+    assert ("zero",) not in axis.calls
+
+
+def test_a_controller_that_does_not_take_up_the_home_command_is_stopped(monkeypatch):
+    monkeypatch.setattr(stages, "HOME_START_TIMEOUT", 0.05)
+
+    class Deaf(FakeAxis):
+        def command_home(self):
+            self.calls.append(("home",))  # the move status still names the last move
+
+    axis = Deaf(position=108.57)
+    axis.command = 0x02
+
+    with pytest.raises(RuntimeError, match="did not take up the home command \\(last command relative move"):
+        stages.home_stage(axis, stages.SAMPLE, stage_cfg(), threading.Event())
+
+    assert ("stop",) in axis.calls and ("zero",) not in axis.calls
+
+
+def test_soft_limit_stops_on_the_sample_are_off_while_it_homes_and_back_after():
+    axis = RecordingAxis(position=108.57)
+    axis.edges.BorderFlags = 0x07  # e.g. left there when the ports were swapped
+
+    stages.home_stage(axis, stages.SAMPLE, stage_cfg(), threading.Event())
+
+    assert axis.border_flags_while_homing & (stages.BORDER_STOP_LEFT | stages.BORDER_STOP_RIGHT) == 0
+    assert int(axis.edges.BorderFlags) == 0x07
+
+
+@pytest.mark.parametrize(
+    "flags, text",
+    [
+        (0x011, "first towards increasing counts until its revolution sensor"),
+        (0x030, "first towards decreasing counts until a limit switch"),
+        (0x000, "until nothing (no stop condition set)"),
+        (0x0A7, "then towards increasing counts until its sync input"),
+    ],
+)
+def test_describe_homing(flags, text):
+    from types import SimpleNamespace
+
+    axis = FakeAxis()
+    axis.get_home_settings = lambda: SimpleNamespace(HomeFlags=flags, FastHome=400, HomeDelta=0)
+    assert text in stages.describe_homing(axis)
+
+
+def test_describe_move_status():
+    assert stages.describe_move_status(0x46) == "last command home, ended with an error (MvCmdSts 0x46)"
+    assert stages.describe_move_status(0x81) == "last command move, running (MvCmdSts 0x81)"
 
 
 @pytest.mark.parametrize(

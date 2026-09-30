@@ -17,6 +17,7 @@ class FakeAxis:
     def __init__(self, position: float = 0, serial: int = 0):
         self.position = position
         self.serial = serial
+        self.command = 0  # the last move command, as the controller's move status names it
         self.calls: list[tuple] = []
         self.edges = SimpleNamespace(
             LeftBorder=-1_000_000,
@@ -41,7 +42,7 @@ class FakeAxis:
 
     def get_status(self):
         # always "stopped"; homed (0x20) with a 24 V motor supply
-        return SimpleNamespace(MvCmdSts=ximc.MvcmdStatus(0), Flags=0x20, Upwr=2400)
+        return SimpleNamespace(MvCmdSts=self.command, Flags=0x20, Upwr=2400)
 
     def command_stop(self):
         self.calls.append(("stop",))
@@ -75,10 +76,12 @@ class FakeAxis:
         return self.serial
 
     def get_home_settings(self):
-        return SimpleNamespace(HomeFlags=0x1)  # homing starts towards increasing counts
+        # towards increasing counts until the revolution sensor
+        return SimpleNamespace(HomeFlags=0x11, FastHome=500, HomeDelta=0)
 
     def command_home(self):
         self.calls.append(("home",))
+        self.command = 0x06
         self.position = 0
 
     def command_zero(self):

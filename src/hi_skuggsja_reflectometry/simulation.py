@@ -23,7 +23,11 @@ from .stages import (
     BORDER_STOP_RIGHT,
     HOME_DIR_FIRST,
     MVCMD_ERROR,
+    MVCMD_HOME,
+    MVCMD_MOVE,
+    MVCMD_MOVR,
     MVCMD_RUNNING,
+    MVCMD_STOP,
     STATE_IS_HOMED,
     configure_stages,
 )
@@ -63,6 +67,7 @@ class SimAxis:
         self._calb = 1.0  # degrees per full step, from set_calb()
         self.homed = True  # assume the setup was homed before this run
         self._homing = False  # a command_home() move is under way
+        self._command = 0  # the last move command, as the controller's move status names it
         self._edges = SimpleNamespace(
             LeftBorder=-(10**9), RightBorder=10**9, BorderFlags=0, EnderFlags=0
         )
@@ -153,7 +158,7 @@ class SimAxis:
             now = clock.time()
             if self._homing and now >= self._t_end:  # arrived at the home sensor
                 self._homing, self.homed, self._error = False, True, False
-            sts = MVCMD_RUNNING if now < self._t_end else 0
+            sts = self._command | (MVCMD_RUNNING if now < self._t_end else 0)
             if self._error and now >= self._t_end:  # flagged once the stage is at the limit, not before
                 sts |= MVCMD_ERROR
             usteps = round(self._position_at(now) / self._calb * 256)
@@ -166,6 +171,7 @@ class SimAxis:
 
     def command_move_calb(self, position: float) -> None:
         self._check_open()
+        self._command = MVCMD_MOVE
         self._go(position)
 
     def command_movr_calb(self, delta: float) -> None:
@@ -173,6 +179,7 @@ class SimAxis:
         with self._lock:
             now = clock.time()
             base = self._target if now < self._t_end else self._position_at(now)
+            self._command = MVCMD_MOVR
             self._go(base + delta)
 
     def command_stop(self) -> None:
@@ -184,19 +191,23 @@ class SimAxis:
                 self._error = False  # stopped before reaching any limit
             if self._homing:
                 self._homing, self.homed = False, False
+            self._command = MVCMD_STOP
             self._start = self._target = here
             self._t_start = self._t_end = now
             self._stop_requested = True
 
     def get_home_settings(self) -> SimpleNamespace:
-        """The simulated home sensor is at count 0, so homing heads that way."""
-        return SimpleNamespace(HomeFlags=HOME_DIR_FIRST if self.position < 0 else 0)
+        """The simulated home sensor is at count 0, so homing heads that way,
+        stopping at a revolution sensor."""
+        direction = HOME_DIR_FIRST if self.position < 0 else 0
+        return SimpleNamespace(HomeFlags=direction | 0x10, FastHome=500, HomeDelta=0)
 
     def command_home(self) -> None:
         """Starts the move to the home sensor (count 0 here) and returns, like
         the real call; the stage reports itself homed when it arrives."""
         self._check_open()
         with self._lock:
+            self._command = MVCMD_HOME
             self._go(0.0, respect_borders=False)
             self._homing = True
 
