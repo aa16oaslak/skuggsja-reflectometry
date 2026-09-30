@@ -567,15 +567,15 @@ def test_set_zero_asks_before_the_real_sweep_moves_anything(tmp_path, monkeypatc
 def lab_controllers(tmp_path, monkeypatch):
     """The lab PC: the sample's controller (33807) on COM3, the ring's (16158)
     on COM4 -- the other way round from the ports in the default settings --
-    with both serials pinned."""
+    with both serials pinned, and libximc's list of connected controllers
+    coming back empty, as it does there."""
     import libximc.highlevel as real_ximc
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "reflecto.toml").write_text("[stages]\nserial_large = 16158\nserial_small = 33807\n")
     by_port = {"COM3": FakeAxis(position=100.0, serial=33807), "COM4": FakeAxis(position=100.0, serial=16158)}
     monkeypatch.setattr(real_ximc, "Axis", lambda uri: by_port[uri.replace("\\", "/").rsplit("/", 1)[-1]])
-    listing = [{"uri": f"xi-com:\\\\.\\{port}", "device_serial": axis.serial} for port, axis in by_port.items()]
-    monkeypatch.setattr(real_ximc, "enumerate_devices", lambda flags, hints="addr=": listing)
+    monkeypatch.setattr(real_ximc, "enumerate_devices", lambda flags, hints="addr=": [])
     return by_port
 
 
@@ -595,30 +595,24 @@ def test_homing_the_sample_homes_the_sample_controller_wherever_it_is(lab_contro
     assert ("home",) not in lab_controllers["COM4"].calls
 
 
-def test_a_pinned_controller_that_is_not_connected_stops_the_command(lab_controllers, monkeypatch):
-    import libximc.highlevel as real_ximc
+def test_a_pinned_controller_that_is_not_connected_stops_the_command(lab_controllers):
+    def cannot_open():
+        raise ConnectionError("Cannot connect to device via URI='xi-com:\\\\.\\COM4'")
 
-    monkeypatch.setattr(
-        real_ximc, "enumerate_devices", lambda flags, hints="addr=": [{"uri": "xi-com:\\\\.\\COM3", "device_serial": 33807}]
-    )
-
-    result = runner.invoke(cli.app, ["position", "--no-gui"])
-
-    assert result.exit_code == 1
-    assert "Could not find the receiver's controller (16158) on any port" in result.output
-    assert "33807 on COM3" in result.output
-
-
-def test_if_the_ports_cannot_be_listed_a_wrong_port_is_still_refused(lab_controllers, monkeypatch):
-    import libximc.highlevel as real_ximc
-
-    def cannot_list(flags, hints="addr="):
-        raise RuntimeError("enumeration failed")
-
-    monkeypatch.setattr(real_ximc, "enumerate_devices", cannot_list)
+    lab_controllers["COM4"].open_device = cannot_open  # e.g. XILab has it open
 
     result = runner.invoke(cli.app, ["position", "--no-gui"])
 
     assert result.exit_code == 1
-    assert "Could not list the connected controllers" in result.output
-    assert "the two ports are swapped" in result.output and "Nothing was moved" in result.output
+    assert "Could not find the receiver's controller (16158)" in result.output
+    assert "COM4: Cannot connect to device" in result.output and "COM3: controller 33807" in result.output
+
+
+def test_found_by_opening_the_ports_when_the_listing_is_empty(lab_controllers, stages_ok):
+    # the bug seen on the lab PC: libximc's listing was empty, so nothing was "connected"
+    result = runner.invoke(cli.app, ["homing", "--no-gui", "--stage", "receiver"], input="clear\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Receiver R1: its controller (16158) is on COM4" in result.output
+    assert ("home",) in lab_controllers["COM4"].calls  # the ring's controller
+    assert ("home",) not in lab_controllers["COM3"].calls

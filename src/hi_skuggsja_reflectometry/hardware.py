@@ -117,7 +117,8 @@ def probe_stage(name: str, uri: str, large: bool, cfg: StageConfig) -> DeviceSta
     except Exception as e:  # noqa: BLE001 -- any failure to open means not usable
         return DeviceStatus(
             name, address, FAIL,
-            f"cannot open {address}: not connected, switched off, or in use by another program",
+            f"cannot open {address}: not connected, switched off, or in use by another program "
+            "(XILab, or reflecto in another window)",
             [f"{uri}: {str(e).splitlines()[0] if str(e) else type(e).__name__}"],
         )
     try:

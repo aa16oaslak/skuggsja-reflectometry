@@ -1,5 +1,6 @@
 import sys
 import threading
+from dataclasses import replace
 
 import libximc.highlevel as real_ximc
 import pytest
@@ -425,15 +426,34 @@ def test_open_stages_goes_ahead_with_the_right_controllers(monkeypatch):
 
 def test_locate_controllers_changes_nothing_without_pinned_serials(monkeypatch):
     monkeypatch.setattr(real_ximc, "enumerate_devices", lambda *a: pytest.fail("listed the ports"))
+    monkeypatch.setattr(real_ximc, "Axis", lambda uri: pytest.fail("opened a port"))
     cfg = stage_cfg()
     assert stages.locate_controllers(cfg) == (cfg, [])
 
 
-def test_locate_controllers_uses_the_port_each_pinned_controller_is_on(monkeypatch):
-    listing = [{"uri": "xi-com:\\\\.\\COM4", "device_serial": 16158}, {"uri": "xi-com:\\\\.\\COM3", "device_serial": 33807}]
-    monkeypatch.setattr(real_ximc, "enumerate_devices", lambda *a: listing)
+def lab_ports(monkeypatch, by_port, listing=()):
+    monkeypatch.setattr(real_ximc, "Axis", lambda uri: by_port[uri.replace("\\", "/").rsplit("/", 1)[-1]])
+    monkeypatch.setattr(real_ximc, "enumerate_devices", lambda *a: list(listing))
 
-    located, notes = stages.locate_controllers(pinned())
 
-    assert (located.device_uri_large, located.device_uri_small) == ("xi-com:\\\\.\\COM4", "xi-com:\\\\.\\COM3")
+def test_locate_controllers_opens_the_ports_in_the_settings(monkeypatch):
+    by_port = {"COM3": FakeAxis(serial=33807), "COM4": FakeAxis(serial=16158)}
+    lab_ports(monkeypatch, by_port)  # an empty listing, as on the lab PC
+    cfg = replace(pinned(), device_uri_large="xi-com:\\\\.\\COM3", device_uri_small="xi-com:\\\\.\\COM4")
+
+    located, notes = stages.locate_controllers(cfg)
+
+    assert (stages.port_name(located.device_uri_large), stages.port_name(located.device_uri_small)) == ("COM4", "COM3")
     assert len(notes) == 2 and "using COM4" in notes[0]
+    assert all(axis.calls[-1] == ("close",) for axis in by_port.values())
+
+
+def test_locate_controllers_looks_in_the_listing_for_a_controller_on_another_port(monkeypatch):
+    by_port = {"COM3": FakeAxis(serial=33807), "COM4": FakeAxis(serial=99999)}
+    lab_ports(monkeypatch, by_port, [{"uri": "xi-com:\\\\.\\COM7", "device_serial": 16158}])
+    cfg = replace(pinned(), device_uri_large="xi-com:\\\\.\\COM3", device_uri_small="xi-com:\\\\.\\COM4")
+
+    located, _notes = stages.locate_controllers(cfg)
+
+    assert stages.port_name(located.device_uri_large) == "COM7"
+    assert stages.port_name(located.device_uri_small) == "COM3"
