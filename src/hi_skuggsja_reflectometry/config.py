@@ -31,6 +31,10 @@ class StageConfig:
     res_small: float
     angle_min: float
     angle_max: float
+    # Serial numbers of the controllers that belong on each port ('reflecto
+    # check' shows them); 0 = not checked.
+    serial_large: int = 0
+    serial_small: int = 0
 
 
 @dataclass

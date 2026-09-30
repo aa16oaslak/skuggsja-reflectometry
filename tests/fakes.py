@@ -14,8 +14,9 @@ class FakeAxis:
     wait_for_stop() returns on its first poll instead of sleeping.
     """
 
-    def __init__(self, position: float = 0):
+    def __init__(self, position: float = 0, serial: int = 0):
         self.position = position
+        self.serial = serial
         self.calls: list[tuple] = []
         self.edges = SimpleNamespace(
             LeftBorder=-1_000_000,
@@ -69,6 +70,9 @@ class FakeAxis:
     def command_homezero(self):
         self.calls.append(("homezero",))
         self.position = 0
+
+    def get_serial_number(self):
+        return self.serial
 
     def get_home_settings(self):
         return SimpleNamespace(HomeFlags=0x1)  # homing starts towards increasing counts

@@ -309,3 +309,49 @@ def test_open_stages_reports_device_open_failure_cleanly(monkeypatch):
 
     with pytest.raises(stages.HardwareUnavailable, match="large \\(receiver\\) stage"):
         stages.open_stages(cfg)
+
+
+# -- the right controller on each port ------------------------------------------------------
+
+
+def pinned(receiver=16158, sample=33807):
+    from dataclasses import replace
+
+    return replace(stage_cfg(), serial_large=receiver, serial_small=sample)
+
+
+def test_serial_problem_names_what_is_wrong():
+    cfg = pinned()
+    assert stages.serial_problem(FakeAxis(serial=33807), True, stage_cfg()) is None  # nothing pinned
+    assert stages.serial_problem(FakeAxis(serial=16158), True, cfg) is None
+    assert "the two ports are swapped" in stages.serial_problem(FakeAxis(serial=33807), True, cfg)
+    assert "has controller 11111, but the receiver's is 16158" in stages.serial_problem(FakeAxis(serial=11111), True, cfg)
+
+    class Unreadable(FakeAxis):
+        def get_serial_number(self):
+            raise RuntimeError("no answer")
+
+    assert "could not be read" in stages.serial_problem(Unreadable(), False, cfg)
+
+
+def test_open_stages_refuses_swapped_ports_before_writing_anything(monkeypatch):
+    by_port = {"COM3": FakeAxis(serial=33807), "COM4": FakeAxis(serial=16158)}  # the lab PC's wiring
+    monkeypatch.setattr(real_ximc, "Axis", lambda uri: by_port[uri])
+    edges = {port: axis.edges for port, axis in by_port.items()}
+
+    with pytest.raises(stages.HardwareUnavailable, match="COM3 \\(receiver\\): it has the sample's controller"):
+        stages.open_stages(pinned())
+
+    for port, axis in by_port.items():
+        assert axis.calls[-1] == ("close",)
+        assert axis.edges is edges[port] and axis.calibration == (1.0, 9)  # no limits, no calibration written
+
+
+def test_open_stages_goes_ahead_with_the_right_controllers(monkeypatch):
+    by_port = {"COM3": FakeAxis(serial=16158), "COM4": FakeAxis(serial=33807)}
+    monkeypatch.setattr(real_ximc, "Axis", lambda uri: by_port[uri])
+
+    large, small = stages.open_stages(pinned())
+
+    assert (large.serial, small.serial) == (16158, 33807)
+    assert large.calibration == (0.0072, 9)

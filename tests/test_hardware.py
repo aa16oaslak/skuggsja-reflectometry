@@ -302,3 +302,42 @@ def test_format_readings_warns_about_stages_that_are_not_homed(cfg):
 
     assert "178.10°" in text and "228.73°" in text
     assert "NOT homed" in text and "reflecto homing" in text
+
+
+# -- the right controller on each port ------------------------------------------------------
+
+
+def pin(cfg, receiver=16158, sample=33807):
+    from dataclasses import replace
+
+    return replace(cfg.stages, serial_large=receiver, serial_small=sample)
+
+
+def test_check_fails_a_port_with_the_wrong_controller(cfg, monkeypatch):
+    fake_ximc(monkeypatch, lambda uri: FakeAxis(position=cfg.stages.zero_l - 60, serial=33807))
+
+    status = hardware.probe_stage(hardware.RECEIVER, cfg.stages.device_uri_large, True, pin(cfg))
+
+    assert status.state == FAIL
+    assert status.summary.startswith("wrong controller: it has the sample's controller (33807)")
+
+
+def test_check_suggests_pinning_until_it_is_done(cfg, monkeypatch):
+    fake_ximc(monkeypatch, lambda uri: FakeAxis(position=cfg.stages.zero_l - 60, serial=16158))
+
+    unpinned = hardware.probe_stage(hardware.RECEIVER, cfg.stages.device_uri_large, True, cfg.stages)
+    pinned = hardware.probe_stage(hardware.RECEIVER, cfg.stages.device_uri_large, True, pin(cfg))
+
+    assert unpinned.state == OK and any("set serial_large" in d for d in unpinned.details)
+    assert "Serial number 16158" in unpinned.details
+    assert pinned.state == OK and not any("serial_large" in d for d in pinned.details)
+
+
+def test_open_stages_readonly_refuses_the_wrong_controllers(cfg, monkeypatch):
+    by_uri = {cfg.stages.device_uri_large: FakeAxis(serial=33807), cfg.stages.device_uri_small: FakeAxis(serial=16158)}
+    fake_ximc(monkeypatch, lambda uri: by_uri[uri])
+
+    with pytest.raises(hardware.HardwareUnavailable, match="swapped"), hardware.open_stages_readonly(pin(cfg)):
+        pytest.fail("got to use the stages")
+
+    assert all(axis.calls[-1] == ("close",) for axis in by_uri.values())

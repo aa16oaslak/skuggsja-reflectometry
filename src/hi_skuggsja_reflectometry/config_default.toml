@@ -13,6 +13,11 @@ res_large = 0.0072   # degrees per full motor step, large stage
 res_small = 0.015    # degrees per full motor step, small stage
 angle_min = 30       # degrees, soft limit
 angle_max = 180.0    # degrees, soft limit
+# Serial numbers of the receiver's and the sample's controllers ('reflecto check'
+# shows each port's). Once set, every command checks that each port has the right
+# controller before anything moves, so swapped COM ports are caught. 0 = not checked.
+serial_large = 0
+serial_small = 0
 
 [toptica]
 host = "192.0.2.1"  # placeholder -- override in reflecto.toml with the real instrument address

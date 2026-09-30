@@ -561,3 +561,17 @@ def test_set_zero_asks_before_the_real_sweep_moves_anything(tmp_path, monkeypatc
     result = runner.invoke(cli.app, args, input="clear\n")
     assert result.exit_code == 0, result.output
     assert len(real_runs) == 1
+
+
+def test_swapped_ports_stop_a_command_before_anything_moves(tmp_path, monkeypatch):
+    import libximc.highlevel as real_ximc
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "reflecto.toml").write_text("[stages]\nserial_large = 16158\nserial_small = 33807\n")
+    by_port = {"COM3": FakeAxis(serial=33807), "COM4": FakeAxis(serial=16158)}
+    monkeypatch.setattr(real_ximc, "Axis", lambda uri: by_port[uri.rsplit("\\", 1)[-1]])
+
+    result = runner.invoke(cli.app, ["position", "--no-gui"])
+
+    assert result.exit_code == 1
+    assert "the two ports are swapped" in result.output and "Nothing was moved" in result.output

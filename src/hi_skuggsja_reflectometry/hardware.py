@@ -24,6 +24,9 @@ from .stages import (
     HardwareUnavailable,
     _load_ximc,
     _open_axis,
+    port_name,
+    serial_problem,
+    verify_controllers,
 )
 
 if TYPE_CHECKING:
@@ -120,7 +123,18 @@ def probe_stage(name: str, uri: str, large: bool, cfg: StageConfig) -> DeviceSta
     try:
         res = cfg.res_large if large else cfg.res_small
         axis.set_calb(res, axis.get_engine_settings().MicrostepMode)  # library-side units only
-        return inspect_stage(axis, name, address, large, cfg)
+        status = inspect_stage(axis, name, address, large, cfg)
+        problem = serial_problem(axis, large, cfg)
+        if problem:
+            return replace(status, state=FAIL, summary=f"wrong controller: {problem}", details=[problem, *status.details])
+        if not (cfg.serial_large if large else cfg.serial_small):
+            key = "serial_large" if large else "serial_small"
+            hint = (
+                f"To catch swapped ports, set {key} to this port's serial number under [stages] in "
+                "reflecto.toml, once you're sure this is the right controller."
+            )
+            status = replace(status, details=[*status.details, hint])
+        return status
     except Exception as e:  # noqa: BLE001
         return DeviceStatus(name, address, FAIL, "opened, but reading its status failed", [f"{type(e).__name__}: {e}"])
     finally:
@@ -222,11 +236,6 @@ def format_statuses(statuses: list[DeviceStatus]) -> str:
         if s.state in (WARN, FAIL):
             lines.extend(f"         {'':<{width}}  - {d}" for d in s.details)
     return "\n".join(lines)
-
-
-def port_name(uri: str) -> str:
-    """'xi-com:\\\\.\\COM3' -> 'COM3'."""
-    return uri.replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def _is_placeholder(host: str) -> bool:
@@ -345,6 +354,7 @@ def open_stages_readonly(cfg: StageConfig) -> Iterator[tuple[Any, Any]]:
             axis = _open_axis(ximc, uri, label)
             opened.append(axis)
             axis.set_calb(res, axis.get_engine_settings().MicrostepMode)
+        verify_controllers(opened[0], opened[1], cfg)
         yield opened[0], opened[1]
     finally:
         for axis in opened:

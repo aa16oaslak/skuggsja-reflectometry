@@ -94,6 +94,26 @@ setting changes.
 `--no-gui` just prints the result (exit code 0 if everything is usable, 1
 if not), and `--simulate` checks a simulated setup, e.g. to see the window.
 
+**Which controller is on which port.** Windows numbers the USB ports as it
+likes, so after plugging the controllers into another PC or other sockets the
+receiver's and the sample's controllers can end up on each other's COM ports.
+Nothing else would notice: every command would then drive the wrong stage,
+with the other stage's calibration and soft limits. Pin each controller's
+serial number (shown by `reflecto check`) under `[stages]` in `reflecto.toml`,
+once you have confirmed which is which (e.g. with the move buttons in
+`reflecto position`):
+
+```toml
+[stages]
+device_uri_large = 'xi-com:\\.\COM4'   # the receiver's controller (8MRB450)
+device_uri_small = 'xi-com:\\.\COM3'   # the sample's controller (8MR174)
+serial_large = 16158
+serial_small = 33807
+```
+
+From then on every command checks each port has the right controller before
+anything is written or moved, and says so when the ports are swapped.
+
 ## See where the arms are
 
 ```powershell

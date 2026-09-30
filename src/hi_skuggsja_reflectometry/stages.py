@@ -229,6 +229,51 @@ def set_boundaries(axis: ximc.Axis, res: float, angle_min: float, angle_max: flo
     axis.set_edges_settings(edges)
 
 
+def port_name(uri: str) -> str:
+    """'xi-com:\\\\.\\COM3' -> 'COM3'."""
+    return uri.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def serial_problem(axis: Any, large: bool, cfg: StageConfig) -> str | None:
+    """Why the controller on the receiver's (large) or sample's port is not
+    the one the settings pin there, or None if it is or nothing is pinned."""
+    expected = cfg.serial_large if large else cfg.serial_small
+    if not expected:
+        return None
+    try:
+        actual = int(axis.get_serial_number())
+    except Exception as e:  # noqa: BLE001 -- can't check it, so it doesn't pass
+        return f"its controller's serial number could not be read ({e}), so it can't be checked"
+    if actual == expected:
+        return None
+    role, other_role = (RECEIVER, SAMPLE) if large else (SAMPLE, RECEIVER)
+    other = cfg.serial_small if large else cfg.serial_large
+    if actual == other:
+        return (
+            f"it has the {other_role}'s controller ({actual}), not the {role}'s ({expected}): the two ports are "
+            "swapped. Swap device_uri_large and device_uri_small in reflecto.toml"
+        )
+    return (
+        f"it has controller {actual}, but the {role}'s is {expected} (serial_{'large' if large else 'small'} in "
+        "the settings). Check which port each controller is on"
+    )
+
+
+def verify_controllers(large_stage: Any, small_stage: Any, cfg: StageConfig) -> None:
+    """Raises HardwareUnavailable if a port has another controller than the
+    settings pin there. Call it before anything is written or moved."""
+    problems = [
+        f"{port_name(uri)} ({role}): {problem}."
+        for axis, uri, role, large in (
+            (large_stage, cfg.device_uri_large, RECEIVER, True),
+            (small_stage, cfg.device_uri_small, SAMPLE, False),
+        )
+        if (problem := serial_problem(axis, large, cfg))
+    ]
+    if problems:
+        raise HardwareUnavailable("Wrong controller on a port. " + " ".join(problems) + " Nothing was moved.")
+
+
 def _open_axis(ximc, uri: str, label: str) -> ximc.Axis:
     axis = ximc.Axis(uri)
     try:
@@ -250,7 +295,17 @@ def open_stages(cfg: StageConfig) -> tuple[ximc.Axis, ximc.Axis]:
     ximc = _load_ximc()
 
     large_stage = _open_axis(ximc, cfg.device_uri_large, "large (receiver)")
-    small_stage = _open_axis(ximc, cfg.device_uri_small, "small (sample)")
+    try:
+        small_stage = _open_axis(ximc, cfg.device_uri_small, "small (sample)")
+    except HardwareUnavailable:
+        large_stage.close_device()
+        raise
+    try:
+        verify_controllers(large_stage, small_stage, cfg)  # before any setting is written
+    except HardwareUnavailable:
+        for axis in (large_stage, small_stage):
+            axis.close_device()
+        raise
     configure_stages(large_stage, small_stage, cfg)
     return large_stage, small_stage
 
