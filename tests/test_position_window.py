@@ -3,7 +3,9 @@ import pytest
 
 from hi_skuggsja_reflectometry import clock, hardware, sweeps
 from hi_skuggsja_reflectometry import config as cfgmod
+from hi_skuggsja_reflectometry.arm_mover import ArmMover
 from hi_skuggsja_reflectometry.position_window import PositionWindow, parse_turn_step
+from hi_skuggsja_reflectometry.stages import RECEIVER, SAMPLE
 from hi_skuggsja_reflectometry.stop_window import StopWindowUnavailable
 
 
@@ -186,3 +188,129 @@ def test_position_command_opens_the_window(monkeypatch, tmp_path):
         pytest.skip("no display for Tk")
 
     assert result.exit_code == 0, result.output
+
+
+# -- turning the real arms from the window -----------------------------------------------
+
+
+def wait_for_move(window, mover, then_do):
+    """Calls then_do() once the mover has finished its move."""
+
+    def check():
+        if mover.state()[0] is None:
+            then_do()
+        else:
+            window.root.after(20, check)
+
+    window.root.after(20, check)
+
+
+def test_moves_are_locked_until_allowed(rig, open_window):
+    mover = ArmMover(rig.large, rig.small, rig.cfg.stages)
+    window = open_window(mover=mover)
+    seen = {}
+
+    def look():
+        window._refresh()
+        seen["before"] = (window.banner.cget("text"), str(window.arm_buttons[RECEIVER][0].cget("state")))
+        window.arm_buttons[RECEIVER][0].invoke()  # ignored while not allowed
+        window.allow_moves.set(True)
+        window._allow_changed()
+        window._refresh()
+        seen["after"] = (window.banner.cget("text"), str(window.arm_buttons[RECEIVER][0].cget("state")))
+        window._cancel()
+
+    then(window, look)
+    window.run()
+
+    assert seen["before"] == ("READ ONLY - nothing moves", "disabled")
+    assert seen["after"] == ("MOVES ALLOWED - the real arms can move", "normal")
+    assert rig.large.moves == 0
+
+
+@pytest.mark.parametrize("stage", [RECEIVER, SAMPLE])
+def test_arms_turn_the_way_the_drawing_shows_and_follow_mirror(rig, open_window, stage):
+    mover = ArmMover(rig.large, rig.small, rig.cfg.stages)
+    window = open_window(mover=mover)
+    index = 1 if stage == RECEIVER else 0  # rig.angles() is (sample, receiver)
+    seen = [rig.angles()[index]]
+
+    def step(actions):
+        if not actions:
+            window._cancel()
+            return
+        action, rest = actions[0], actions[1:]
+        action()
+        wait_for_move(window, mover, lambda: (seen.append(rig.angles()[index]), step(rest)))
+
+    def start():
+        window.allow_moves.set(True)
+        window._allow_changed()
+        window.move_entry.delete(0, "end")
+        window.move_entry.insert(0, "2,5")
+        clockwise = window.arm_buttons[stage][1]
+        step([
+            clockwise.invoke,  # the drawing grows clockwise: +2.5°
+            lambda: (window._mirror(), clockwise.invoke()),  # now it grows counterclockwise: -2.5°
+        ])
+
+    then(window, start)
+    window.run()
+
+    assert seen[1] - seen[0] == pytest.approx(2.5)
+    assert seen[2] - seen[1] == pytest.approx(-2.5)
+
+
+def test_a_bad_step_is_refused_in_the_window(rig, open_window):
+    mover = ArmMover(rig.large, rig.small, rig.cfg.stages)
+    window = open_window(mover=mover)
+    seen = {}
+
+    def try_it():
+        window.allow_moves.set(True)
+        window._allow_changed()
+        for text in ("15", "abc"):
+            window.move_entry.delete(0, "end")
+            window.move_entry.insert(0, text)
+            window.arm_buttons[RECEIVER][1].invoke()
+            seen[text] = window.move_status.cget("text")
+        window._cancel()
+
+    then(window, try_it)
+    window.run()
+
+    assert "at most 10" in seen["15"] and "at most 10" in seen["abc"]
+    assert rig.large.moves == 0
+
+
+def test_closing_the_window_stops_a_move(rig, open_window):
+    rig.large.speed = 0.5  # 5° takes 10 s
+    mover = ArmMover(rig.large, rig.small, rig.cfg.stages)
+    window = open_window(mover=mover)
+    seen = {}
+
+    def move_then_close():
+        window.allow_moves.set(True)
+        window._allow_changed()
+        window.move_entry.delete(0, "end")
+        window.move_entry.insert(0, "5")
+        window.arm_buttons[RECEIVER][0].invoke()
+        seen["moving"] = rig.large.moving
+        window.root.after(200, window._cancel)
+
+    with clock.accelerated(1):  # real time: the rig fixture otherwise runs the clock fast
+        then(window, move_then_close)
+        window.run()
+        mover.close()
+
+    assert seen["moving"] is True
+    assert not rig.large.moving
+
+
+def test_the_step_before_a_sweep_offers_no_moves(open_window):
+    window = open_window(confirm=True)
+    try:
+        assert window.move_buttons == []
+        assert window.banner.cget("text") == "READ ONLY - nothing moves"
+    finally:
+        window.root.destroy()

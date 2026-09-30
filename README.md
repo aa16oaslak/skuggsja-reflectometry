@@ -118,6 +118,23 @@ either way, and **Save** writes both into the `[view]` section of
   wherever it was when switched on. Home the stages with `reflecto homing`.
 - After homing, the receiver should be at its home, almost opposite Tx.
 
+To calibrate, the window can also turn the real arms. Tick **Allow moves**
+(the banner turns orange; until then nothing can move), type how far in
+**Move by** (1° to start with, at most 10° per click), and click
+**counterclockwise** or **clockwise** next to the receiver or the sample.
+Each arm turns the way the *drawing* shows it, so:
+
+- if the real arm turns the other way, press **Mirror**;
+- if it turns the right way but by a different amount, the degrees-per-step
+  calibration (`res_large`, `res_small`) is off.
+
+One move at a time. The **STOP** button in that box stops both stages, and
+closing the window (or Ctrl+C) stops them too. Once the receiver is homed,
+moves that would leave its soft limits (30°-180°) are refused; before that
+the limits are counted from an unknown zero, so the controller may stop a
+move early at a limit that isn't where the settings say. The sample stage has
+no soft limits at all, so watch its micrometer and cables.
+
 `--no-gui` prints the angles instead, and `--simulate` shows a simulated
 setup, e.g. to try the window.
 

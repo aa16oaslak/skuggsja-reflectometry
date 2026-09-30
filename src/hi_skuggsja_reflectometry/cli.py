@@ -14,6 +14,7 @@ import typer
 
 from . import clock, hardware, live_view, simulation, sweeps, toptica
 from . import config as cfgmod
+from .arm_mover import ArmMover
 from .emergency_stop import run_with_emergency_stop
 from .hardware_window import HardwareCheckWindow
 from .homing_window import HomingProgress, homing_window
@@ -173,18 +174,21 @@ def position(
     simulate: bool = typer.Option(False, "--simulate", help="Read a simulated setup instead, e.g. to try the window."),
     config: Path | None = CONFIG_OPTION,
 ) -> None:
-    """Show where both arms are now, read from the stages without moving them. The drawing can be
-    mirrored and turned to match the table, and saved."""
+    """Show where both arms are now, read from the stages. The drawing can be mirrored and turned
+    to match the table, and saved. After ticking "Allow moves", buttons turn the real arms a few
+    degrees at a time, to calibrate; nothing moves before that."""
     cfg = _load_config(config)
     with _readable_stages(cfg, simulate) as axes:
         reader = hardware.PositionReader(*axes).start()
+        mover = ArmMover(*axes, cfg.stages)
         try:
             if gui:
-                _position_window(reader, cfg, config, simulated=simulate)
+                _position_window(reader, cfg, config, simulated=simulate, mover=mover)
             else:
                 typer.echo("Where the arms are now (read from the stages; nothing moved):")
                 typer.echo(hardware.format_readings(*reader.latest(), cfg.stages))
         finally:
+            mover.close()  # stops the stages if they were moved, before they are let go
             reader.stop()
 
 
