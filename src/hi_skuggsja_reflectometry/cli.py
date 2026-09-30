@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from enum import Enum
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,18 @@ from . import clock, hardware, live_view, simulation, sweeps, toptica
 from . import config as cfgmod
 from .emergency_stop import run_with_emergency_stop
 from .hardware_window import HardwareCheckWindow
+from .homing_window import HomingProgress, homing_window
 from .position_window import PositionResult, PositionWindow
-from .stages import HardwareUnavailable, open_stages
+from .stages import (
+    HOMING_ORDER,
+    RECEIVER,
+    SAMPLE,
+    STAGE_LABELS,
+    HardwareUnavailable,
+    home_stages,
+    homing_direction,
+    open_stages,
+)
 from .stop_window import StopWindowUnavailable
 
 app = typer.Typer(help="THz reflectometry stage + TOptica sweep control, with an on-screen emergency stop.")
@@ -115,9 +126,16 @@ def check(
 
 
 @contextmanager
-def _readable_stages(cfg: cfgmod.AppConfig, simulated: bool) -> Iterator[tuple[Any, Any]]:
+def _readable_stages(
+    cfg: cfgmod.AppConfig, simulated: bool, rig: simulation.SimRig | None = None
+) -> Iterator[tuple[Any, Any]]:
     """Both stages, opened to be read without moving: the real ones, or a
-    simulated pair."""
+    simulated pair (`rig`'s, if given, which is left for the caller to close)."""
+    if rig is not None:
+        for axis in (rig.large, rig.small):
+            axis.open_device()
+        yield rig.large, rig.small
+        return
     if simulated:
         rig = simulation.SimRig(cfg)
         try:
@@ -170,6 +188,139 @@ def position(
             reader.stop()
 
 
+def _confirm_homing(
+    stages: list[str], readings: list[hardware.ArmReading], directions: dict[str, int | None], cfg: cfgmod.AppConfig
+) -> bool:
+    """Says what homing will do, and asks for 'clear' before anything moves."""
+    order = [s for s in HOMING_ORDER if s in stages]
+    typer.echo(
+        "\nAbout to home: " + ", then ".join(STAGE_LABELS[s] for s in order) + ".\n"
+        "Each stage turns, with its controller's own homing settings, until it finds its home sensor "
+        "(that can be most of a full turn), and only then is its count set to 0 there."
+    )
+    for stage in order:
+        large = stage == RECEIVER
+        reading = readings[0 if large else 1]
+        d = directions.get(stage)
+        if d is None:
+            way = "in a direction that could not be read from its controller"
+        else:
+            grows = (d > 0) != large  # a higher count is a smaller receiver angle, a larger sample angle
+            way = (
+                f"the way its angle {'increases' if grows else 'decreases'} "
+                f"(as when a sweep moves it to a {'larger' if grows else 'smaller'} angle)"
+            )
+        state = "homed" if reading.homed else "NOT homed, so this angle may be wrong"
+        typer.echo(
+            f"  {STAGE_LABELS[stage]:<12} now at {hardware.arm_angle(reading, large, cfg.stages):.2f}° ({state}).\n"
+            f"  {'':<12} Homing starts turning {way}."
+        )
+    typer.echo(
+        "Check that the whole way round in those directions is free: cables, the micrometer and mounts on the "
+        "sample holder, and the Tx and Rx modules. Keep a hand on STOP (or Ctrl+C)."
+    )
+    return _ask("Type 'clear' to home, anything else to cancel: ") == "clear"
+
+
+def _read_for_homing(large: Any, small: Any) -> tuple[list[hardware.ArmReading], dict[str, int | None]]:
+    readings = [hardware.read_arm(large), hardware.read_arm(small)]
+    return readings, {RECEIVER: homing_direction(large), SAMPLE: homing_direction(small)}
+
+
+class HomeStages(str, Enum):
+    both = "both"
+    receiver = RECEIVER
+    sample = SAMPLE
+
+
+HOME_STAGE_OPTION = typer.Option(
+    HomeStages.both, "--stage", help="Which stage to home: both (default; the sample first), receiver, or sample."
+)
+
+
+@app.command()
+def homing(
+    stage: HomeStages = HOME_STAGE_OPTION,
+    gui: bool = GUI_OPTION,
+    simulate: bool = typer.Option(False, "--simulate", help="Home a simulated setup instead, to try the command."),
+    skip_check: bool = typer.Option(
+        False, "--skip-check", help="Start even if the stage check reports a problem. Only if the check itself is wrong."
+    ),
+    config: Path | None = CONFIG_OPTION,
+) -> None:
+    """Drive the stages to their home sensors and set their counts to 0 there, so their angles are
+    right again (after the controllers were switched on, for example). Asks you to confirm the path
+    is clear before anything moves, and shows where the arms are afterwards."""
+    cfg = _load_config(config)
+    to_home = list(HOMING_ORDER) if stage is HomeStages.both else [stage.value]
+    rig = None
+    if simulate:
+        rig = simulation.SimRig(cfg)
+        rig.large.homed = rig.small.homed = False
+    try:
+        with clock.accelerated(DEFAULT_SIM_SPEED if simulate else 1.0):
+            if not simulate:
+                _preflight(lambda: hardware.check_stages(cfg), cfg, skip_check, simulated=False)
+            with _readable_stages(cfg, simulate, rig) as axes:
+                readings, directions = _read_for_homing(*axes)
+            if not _confirm_homing(to_home, readings, directions, cfg):
+                typer.echo("Cancelled. Nothing was moved.")
+                raise typer.Exit(code=1)
+
+            if rig is not None:
+                for axis in (rig.large, rig.small):
+                    axis.open_device()
+                large, small = rig.large, rig.small
+            else:
+                try:
+                    large, small = open_stages(cfg.stages)
+                except HardwareUnavailable as e:
+                    typer.echo(f"Error: {e}")
+                    raise typer.Exit(code=1) from None
+            progress = HomingProgress(to_home)
+            order = ", then ".join(STAGE_LABELS[s] for s in progress.stages)
+            try:
+                run_with_emergency_stop(
+                    home_stages, [large, small], list(sweeps.STAGE_NAMES),
+                    large, small, to_home, cfg.stages, progress.homed,
+                    gui=gui, title=f"Homing {order}", window=homing_window(progress, simulate),
+                )
+            except StopWindowUnavailable as e:
+                typer.echo(f"Error: {e}")
+                raise typer.Exit(code=1) from None
+
+            done = progress.done()
+            missing = [STAGE_LABELS[s] for s in progress.stages if s not in done]
+            if missing:
+                typer.echo(f"Not homed: {', '.join(missing)}. Its count was left as it was.")
+            else:
+                typer.echo("Homing finished.")
+            typer.echo(
+                f"In the settings the receiver's home is {cfg.stages.zero_l:g}° and the sample's "
+                f"{-cfg.stages.zero_s:g}° from Tx: check the arms are there on the table."
+            )
+            with _readable_stages(cfg, simulate, rig) as axes:
+                reader = hardware.PositionReader(*axes).start()
+                try:
+                    if gui:
+                        _position_window(
+                            reader, cfg, config, simulated=simulate,
+                            heading=(
+                                f"After homing: the receiver's home is {cfg.stages.zero_l:g}°, the "
+                                f"sample's {-cfg.stages.zero_s:g}°.\nDoes the drawing match the table now?"
+                            ),
+                        )
+                    else:
+                        typer.echo(hardware.format_readings(*reader.latest(), cfg.stages))
+                finally:
+                    reader.stop()
+    finally:
+        if rig is not None:
+            rig.close()
+    if missing:
+        raise typer.Exit(code=1)
+
+
 def _preflight(run_check, cfg: cfgmod.AppConfig, skip: bool, simulated: bool) -> list[hardware.DeviceStatus]:
     """The hardware check before a sweep. Exits, before anything has moved,
     if a device is not usable."""
@@ -200,7 +351,12 @@ def _watch(axis) -> hardware.WatchedAxis:
 
 
 def _confirm_positions(
-    cfg: cfgmod.AppConfig, config_path: Path | None, plan: list[sweeps.PlannedStep], title: str, gui: bool
+    cfg: cfgmod.AppConfig,
+    config_path: Path | None,
+    plan: list[sweeps.PlannedStep],
+    title: str,
+    gui: bool,
+    set_zero: bool = False,
 ) -> tuple[tuple[hardware.ArmReading, hardware.ArmReading], cfgmod.AppConfig]:
     """Step 1 of 3 before a real sweep: where the arms are, read without
     moving them, and whether that matches the real setup. Returns the
@@ -213,7 +369,15 @@ def _confirm_positions(
             if gui:
                 result = _position_window(
                     reader, cfg, config_path, plan=plan, confirm=True,
-                    heading=f"Step 1 of 3 before: {title}\nDoes the drawing match the real arms?",
+                    heading=(
+                        f"Step 1 of 3 before: {title}\n"
+                        + (
+                            "With --set-zero the stages are homed first, so these angles may still be wrong. "
+                            "Confirm to see the sweep simulated."
+                            if set_zero
+                            else "Does the drawing match the real arms?"
+                        )
+                    ),
                 )
             else:
                 readings, errors = reader.latest()
@@ -327,7 +491,7 @@ def _run(
 
     start = None
     if not skip_preview:
-        start, cfg = _confirm_positions(cfg, config_path, plan, title, gui)
+        start, cfg = _confirm_positions(cfg, config_path, plan, title, gui, set_zero)
         typer.echo("Step 2 of 3: the same sweep, simulated from where the arms are (nothing moves).")
         if not _simulate(sweep_fn, plan, title, cfg, sweep_args, gui, speed, skip_check, start=start):
             typer.echo("Cancelled. Nothing was moved.")
@@ -343,6 +507,16 @@ def _run(
         raise typer.Exit(code=1)
     if start is not None:
         _stop_if_moved(large_stage, small_stage, start)
+    if set_zero:
+        readings, directions = _read_for_homing(large_stage, small_stage)
+        if not _confirm_homing(list(HOMING_ORDER), readings, directions, cfg):
+            for axis in (large_stage, small_stage):
+                try:
+                    axis.close_device()
+                except Exception:  # noqa: BLE001, S110 -- leaving anyway
+                    pass
+            typer.echo("Cancelled. Nothing was moved.")
+            raise typer.Exit(code=1)
 
     large, small = _watch(large_stage), _watch(small_stage)
     files = [s.output_file(filename, int_time, freq_start, freq_stop) for s in plan]

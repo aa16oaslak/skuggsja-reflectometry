@@ -107,18 +107,46 @@ Next to it are both angles, the controller positions, and whether each
 stage has been homed since it was switched on.
 
 Stand where you can see the table and make the drawing look like it:
-**Mirror** swaps the direction the angles grow, **Turn** rotates the drawing
-in 15° or 90° steps, and **Save** writes both into the `[view]` section of
+**Mirror** swaps the direction the angles grow, **Turn by** rotates the
+drawing by as many degrees as you type (5° to start with; decimals are fine)
+either way, and **Save** writes both into the `[view]` section of
 `reflecto.toml`. Then check:
 
 - Tx, the receiver and the sample plate should all sit where they are on
   the table. If the receiver or the sample is somewhere else, the angles
   themselves are wrong: a stage that is not homed only counts steps from
-  wherever it was when switched on. Home the stages with `--set-zero`.
+  wherever it was when switched on. Home the stages with `reflecto homing`.
 - After homing, the receiver should be at its home, almost opposite Tx.
 
 `--no-gui` prints the angles instead, and `--simulate` shows a simulated
 setup, e.g. to try the window.
+
+## Home the stages
+
+```powershell
+reflecto homing
+```
+
+Drives each stage to its home sensor and sets its count to 0 there, so the
+angles are right again. Do it after the controllers have been switched on,
+or whenever `reflecto check` or `reflecto position` says a stage is not
+homed. The sample stage (R2) goes first, then the receiver (R1);
+`--stage receiver` or `--stage sample` homes just one.
+
+Before anything moves it shows where each stage is and which way its homing
+starts turning, and asks you to type `clear`. Each stage then turns with its
+controller's own homing settings until it finds its home sensor, which can be
+most of a full turn, so check the whole way round in that direction. A window
+with the STOP button stays open while it homes. Only when the controller
+reports the stage homed is its count set to 0; a stopped or unfinished homing
+leaves the count as it was. The receiver's soft limits are off while it homes
+(they are counted from home, so only right afterwards) and set again straight
+after. Afterwards the `reflecto position` window opens so you can check the
+arms are at their homes on the table: the receiver at `zero_l` (180.5°,
+almost opposite Tx) and the sample at `-zero_s` (40°).
+
+`--no-gui` asks and reports in the terminal (Ctrl+C is the stop), and
+`--simulate` homes a simulated setup, to try it.
 
 ## Run a sweep
 
@@ -128,10 +156,9 @@ reflecto nonspec --start-angle 45 --end-angle 75 --step 15 --filename 310826_non
 ```
 
 `--freq-start`, `--freq-stop`, and `--int-time` default from the config's
-`[scan_defaults]` if omitted. Add `--set-zero` to home and zero both stages
-before the sweep (requires typing `clear` to confirm the homing path is
-clear of obstacles, since homing can move stages outside their normal
-operating range).
+`[scan_defaults]` if omitted. `--set-zero` homes both stages first, exactly
+like `reflecto homing` (you are asked to type `clear` before the real
+stages move), but running `reflecto homing` before the sweep is clearer.
 
 Every sweep starts with the same hardware check as `reflecto check`, printed
 in the terminal. If a device is not usable, the sweep stops there, before
@@ -214,9 +241,6 @@ skips the window and just prints the summary.
 
 - The STOP button is a software stop: it needs the program to be running
   and responsive. It is not a substitute for a physical emergency stop.
-- If you press STOP while the terminal is asking you to type `clear` (homing
-  with `--set-zero`), the stages halt at once, but the prompt still waits
-  for you to press Enter in the terminal before the program exits.
 - `libximc` requires Standa's vendor driver/DLLs on the machine, independent
   of the pip package.
 

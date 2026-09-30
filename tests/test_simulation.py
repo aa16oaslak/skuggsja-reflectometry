@@ -172,16 +172,33 @@ def test_summary_lists_steps_and_soft_limit_stops(rig):
     assert "stopped at the soft limit" in text
 
 
-def test_nonspec_with_set_zero_leaves_sample_at_home_not_15(rig, monkeypatch):
-    # A known bug the simulation makes visible: after --set-zero the sample is
-    # never moved to NONSPEC_SAMPLE_ANGLE, so the scan runs at the sample's home.
-    monkeypatch.setattr("builtins.input", lambda _prompt: "clear")
+def test_nonspec_with_set_zero_scans_with_the_sample_at_15_not_at_home(rig):
+    # used to be a bug: after --set-zero the sample stayed at its home, 40°
     with clock.accelerated(FAST):
         sweeps.sweep_nonspec(
             rig.large, rig.small, rig.cfg, 45.0, 45.0, 15.0, 70.0, 70.2, 3,
             str(rig.output_dir / "run"), True, True, threading.Event(),
         )
-    assert rig.toptica.scans[0].sample == pytest.approx(-rig.cfg.stages.zero_s)  # 40°, not 15°
+    assert rig.toptica.scans[0].sample == pytest.approx(sweeps.NONSPEC_SAMPLE_ANGLE)
+    assert rig.toptica.scans[0].receiver == pytest.approx(45.0)
+
+
+def test_homing_a_simulated_stage_and_stopping_it_midway(rig):
+    rig.large.homed = False
+    with clock.accelerated(FAST):
+        stages.home_stage(rig.large, stages.RECEIVER, rig.cfg.stages, threading.Event())
+        assert (rig.large.position, rig.large.homed) == (0.0, True)
+
+        rig.large.command_move_calb(rig.zero_l - 90)
+        wait_until_stopped(rig.large)
+        rig.large.speed = 1.0  # the way home now takes 90 s of clock time: ~90 ms real, so the stop lands midway
+        stop_event = threading.Event()
+        threading.Timer(0.001, stop_event.set).start()  # STOP soon after homing starts
+        with pytest.raises(RuntimeError, match="not homed"):
+            stages.home_stage(rig.large, stages.RECEIVER, rig.cfg.stages, stop_event)
+
+    assert rig.large.homed is False
+    assert rig.large.position > 1.0  # stopped on the way, and its count not zeroed
 
 
 def test_simulation_can_start_where_the_real_arms_are(cfg):

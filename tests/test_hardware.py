@@ -301,4 +301,4 @@ def test_format_readings_warns_about_stages_that_are_not_homed(cfg):
     text = hardware.format_readings(readings, [None, None], cfg.stages)
 
     assert "178.10°" in text and "228.73°" in text
-    assert "NOT homed" in text and "--set-zero" in text
+    assert "NOT homed" in text and "reflecto homing" in text

@@ -462,3 +462,102 @@ def test_a_mistake_in_the_settings_file_is_reported_cleanly(tmp_path, monkeypatc
     assert result.exit_code == 1
     assert "unknown setting zero_L under [stages]" in result.output
     assert isinstance(result.exception, SystemExit)
+
+
+# -- reflecto homing, and --set-zero -----------------------------------------------------
+
+
+@pytest.fixture
+def stages_ok(monkeypatch):
+    from hi_skuggsja_reflectometry import hardware
+
+    monkeypatch.setattr(
+        cli.hardware, "check_stages",
+        lambda cfg: [hardware.DeviceStatus(n, "test", hardware.WARN, "not homed") for n in ("R1", "R2")],
+    )
+
+
+def test_homing_a_simulated_setup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(cli.app, ["homing", "--simulate", "--no-gui"], input="clear\n")
+
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert out.index("About to home: Sample R2, then Receiver R1.") < out.index("Homing finished.")
+    assert "Homing starts turning the way its angle" in out
+    assert "180.50°" in out and "40.00°" in out  # both at their homes afterwards
+    assert "NOT homed" not in out.split("Homing finished.")[1]
+
+
+def test_homing_only_the_receiver(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(cli.app, ["homing", "--simulate", "--no-gui", "--stage", "receiver"], input="clear\n")
+
+    assert result.exit_code == 0, result.output
+    after = result.output.split("Homing finished.")[1]
+    assert "Sample R2" not in result.output.split("Homing finished.")[0].split("About to home:")[1].split(".")[0]
+    assert "180.50°" in after
+    assert "NOT homed" in after  # the sample was left as it was
+
+
+def test_homing_moves_nothing_unless_clear_is_typed(tmp_path, monkeypatch, stages_at, stages_ok):
+    monkeypatch.chdir(tmp_path)
+    receiver, sample = stages_at(150.49, 17.59)
+    monkeypatch.setattr(cli, "open_stages", lambda stage_cfg: pytest.fail("opened the stages to move them"))
+
+    result = runner.invoke(cli.app, ["homing", "--no-gui"], input="yes\n")
+
+    assert result.exit_code == 1
+    assert "Cancelled. Nothing was moved." in result.output
+    assert "30.01°" in result.output and "57.59°" in result.output  # where they were said to be
+    assert not any(call[0] in (*MOVES, "home", "zero") for axis in (receiver, sample) for call in axis.calls)
+
+
+def test_homing_real_stages(tmp_path, monkeypatch, stages_at, stages_ok):
+    monkeypatch.chdir(tmp_path)
+    receiver, sample = stages_at(150.49, 17.59)
+
+    result = runner.invoke(cli.app, ["homing", "--no-gui"], input="clear\n")
+
+    assert result.exit_code == 0, result.output
+    for axis in (receiver, sample):
+        kinds = [call[0] for call in axis.calls]
+        assert kinds.index("home") < kinds.index("zero")
+
+
+def test_homing_that_the_controller_does_not_finish_exits_with_an_error(tmp_path, monkeypatch, stages_at, stages_ok):
+    monkeypatch.chdir(tmp_path)
+    receiver, _sample = stages_at(150.49, 17.59)
+    real_status = receiver.get_status
+
+    def never_homed():
+        status = real_status()
+        status.Flags = 0
+        return status
+
+    receiver.get_status = never_homed
+
+    result = runner.invoke(cli.app, ["homing", "--no-gui"], input="clear\n")
+
+    assert result.exit_code == 1
+    assert "Not homed: Receiver R1" in result.output
+    assert ("zero",) not in receiver.calls
+
+
+def test_set_zero_asks_before_the_real_sweep_moves_anything(tmp_path, monkeypatch, stages_at, real_runs):
+    monkeypatch.chdir(tmp_path)
+    receiver, sample = stages_at(150.49, 17.59)
+    args = [a for a in PREVIEW_ARGS if a not in ("--speed", "1000")] + ["--skip-preview", "--set-zero"]
+
+    result = runner.invoke(cli.app, args, input="no\n")
+
+    assert result.exit_code == 1
+    assert "About to home" in result.output and "Cancelled. Nothing was moved." in result.output
+    assert real_runs == []
+    assert not any(call[0] in (*MOVES, "home", "zero") for axis in (receiver, sample) for call in axis.calls)
+
+    result = runner.invoke(cli.app, args, input="clear\n")
+    assert result.exit_code == 0, result.output
+    assert len(real_runs) == 1

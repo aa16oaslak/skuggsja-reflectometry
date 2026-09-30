@@ -3,7 +3,7 @@ import pytest
 
 from hi_skuggsja_reflectometry import clock, hardware, sweeps
 from hi_skuggsja_reflectometry import config as cfgmod
-from hi_skuggsja_reflectometry.position_window import PositionWindow
+from hi_skuggsja_reflectometry.position_window import PositionWindow, parse_turn_step
 from hi_skuggsja_reflectometry.stop_window import StopWindowUnavailable
 
 
@@ -66,7 +66,7 @@ def test_not_homed_is_pointed_out_but_does_not_block(rig, open_window):
 
     window.run()
 
-    assert "Not homed" in seen["notice"] and "--set-zero" in seen["notice"]
+    assert "Not homed" in seen["notice"] and "reflecto homing" in seen["notice"]
     assert seen["ok"] == "normal"
 
 
@@ -102,14 +102,58 @@ def test_a_moving_stage_blocks_confirming_until_it_stops(rig, open_window):
     assert seen["ok"] == "disabled"
 
 
+def type_step(window, text):
+    window.step_entry.delete(0, "end")
+    window.step_entry.insert(0, text)
+
+
+@pytest.mark.parametrize(
+    "text, step", [("5", 5.0), ("0.5", 0.5), ("2,5", 2.5), (" 360 ", 360.0), ("0", None), ("-3", None), ("400", None), ("five", None)]
+)
+def test_parse_turn_step(text, step):
+    assert parse_turn_step(text) == step
+
+
+def test_turn_by_any_step_both_ways(open_window):
+    window = open_window()
+    seen = {}
+
+    def turn():
+        assert window.step_entry.get() == "5"  # the default step
+        type_step(window, "2,5")
+        window.ccw_button.invoke()  # 2.5
+        window.ccw_button.invoke()  # 5
+        type_step(window, "0.5")
+        window.cw_button.invoke()  # 4.5
+        seen["direction"] = window.direction_label.cget("text")
+        window.cw_button.invoke()  # 4
+        window.cw_button.invoke()  # 3.5
+        type_step(window, "10")
+        window.cw_button.invoke()  # -6.5 -> 353.5
+        seen["wrapped"] = window.view.tx_direction
+        type_step(window, "a lot")
+        window.cw_button.invoke()  # refused
+        seen["refused"] = (window.view.tx_direction, window.direction_label.cget("text"))
+        window._cancel()
+
+    then(window, turn)
+    window.run()
+
+    assert "Tx is drawn at 4.5°" in seen["direction"]
+    assert seen["wrapped"] == pytest.approx(353.5)
+    assert seen["refused"][0] == pytest.approx(353.5)
+    assert "more than 0 and at most 360" in seen["refused"][1]
+
+
 def test_mirror_turn_and_save_the_drawing(rig, open_window, tmp_path):
     window = open_window()
     seen = {}
 
     def adjust_and_save():
         window._mirror()
-        window._turn(90)
-        window._turn(90)
+        type_step(window, "90")
+        window.ccw_button.invoke()
+        window.ccw_button.invoke()
         seen["before_save"] = window.save_status.cget("text")
         window.save_button.invoke()
         seen["after_save"] = window.save_status.cget("text")

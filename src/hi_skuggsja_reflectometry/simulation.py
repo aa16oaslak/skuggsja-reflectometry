@@ -21,8 +21,10 @@ from .config import AppConfig, TopticaConfig
 from .stages import (
     BORDER_STOP_LEFT,
     BORDER_STOP_RIGHT,
+    HOME_DIR_FIRST,
     MVCMD_ERROR,
     MVCMD_RUNNING,
+    STATE_IS_HOMED,
     configure_stages,
 )
 from .sweeps import PlannedStep
@@ -37,7 +39,6 @@ SAMPLE_SPEED = 10.0
 START_RECEIVER_ANGLE = 90.0
 START_SAMPLE_ANGLE = 0.0
 SUPPLY_VOLTAGE = 24.0  # reported motor supply, volts
-STATE_IS_HOMED = 0x20  # libximc status flag
 
 
 class SimAxis:
@@ -61,6 +62,7 @@ class SimAxis:
         self._open = False
         self._calb = 1.0  # degrees per full step, from set_calb()
         self.homed = True  # assume the setup was homed before this run
+        self._homing = False  # a command_home() move is under way
         self._edges = SimpleNamespace(
             LeftBorder=-(10**9), RightBorder=10**9, BorderFlags=0, EnderFlags=0
         )
@@ -149,6 +151,8 @@ class SimAxis:
         self._check_open()
         with self._lock:
             now = clock.time()
+            if self._homing and now >= self._t_end:  # arrived at the home sensor
+                self._homing, self.homed, self._error = False, True, False
             sts = MVCMD_RUNNING if now < self._t_end else 0
             if self._error and now >= self._t_end:  # flagged once the stage is at the limit, not before
                 sts |= MVCMD_ERROR
@@ -178,9 +182,32 @@ class SimAxis:
             here = self._position_at(now)
             if now < self._t_end:
                 self._error = False  # stopped before reaching any limit
+            if self._homing:
+                self._homing, self.homed = False, False
             self._start = self._target = here
             self._t_start = self._t_end = now
             self._stop_requested = True
+
+    def get_home_settings(self) -> SimpleNamespace:
+        """The simulated home sensor is at count 0, so homing heads that way."""
+        return SimpleNamespace(HomeFlags=HOME_DIR_FIRST if self.position < 0 else 0)
+
+    def command_home(self) -> None:
+        """Starts the move to the home sensor (count 0 here) and returns, like
+        the real call; the stage reports itself homed when it arrives."""
+        self._check_open()
+        with self._lock:
+            self._go(0.0, respect_borders=False)
+            self._homing = True
+
+    def command_zero(self) -> None:
+        """Makes the current position count 0."""
+        self._check_open()
+        with self._lock:
+            now = clock.time()
+            shift = self._position_at(now)
+            self._start -= shift
+            self._target -= shift
 
     def command_homezero(self) -> None:
         """Blocks while the stage travels home (calibrated position 0),

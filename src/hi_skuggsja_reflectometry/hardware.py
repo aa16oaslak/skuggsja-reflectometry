@@ -17,7 +17,14 @@ from typing import TYPE_CHECKING, Any
 
 from . import geometry, toptica
 from .monitoring import LinkMonitor
-from .stages import MVCMD_ERROR, MVCMD_RUNNING, HardwareUnavailable, _load_ximc, _open_axis
+from .stages import (
+    MVCMD_ERROR,
+    MVCMD_RUNNING,
+    STATE_IS_HOMED,
+    HardwareUnavailable,
+    _load_ximc,
+    _open_axis,
+)
 
 if TYPE_CHECKING:
     from .config import AppConfig, StageConfig, TopticaConfig
@@ -28,7 +35,6 @@ RECEIVER, SAMPLE, TOPTICA = "Receiver stage R1", "Sample stage R2", "TOptica"
 
 # libximc status Flags (StateFlags), as plain ints like the flags in stages.py
 STATE_ERRC, STATE_ERRD, STATE_ERRV = 0x1, 0x2, 0x4
-STATE_IS_HOMED = 0x20
 STATE_ALARM = 0x40
 STATE_POWER_OVERHEAT = 0x100
 STATE_CONTROLLER_OVERHEAT = 0x200
@@ -76,7 +82,7 @@ def inspect_stage(axis: Any, name: str, address: str, large: bool, cfg: StageCon
     fails = [text for bit, text in _FAIL_FLAGS if flags & bit]
     warns = [text for bit, text in _WARN_FLAGS if flags & bit]
     if not flags & STATE_IS_HOMED:
-        warns.append("not homed since the controller was switched on, so angles may be off (use --set-zero)")
+        warns.append("not homed since the controller was switched on, so angles may be off (run 'reflecto homing')")
     if int(status.MvCmdSts) & MVCMD_RUNNING:
         warns.append("moving right now")
     if large and not cfg.angle_min - 0.01 <= angle <= cfg.angle_max + 0.01:
@@ -160,6 +166,15 @@ def probe_toptica(cfg: TopticaConfig, timeout: float = 3.0) -> DeviceStatus:
     return DeviceStatus(TOPTICA, address, OK, f"at {freq:.2f} GHz, ready", details)
 
 
+def check_stages(cfg: AppConfig) -> list[DeviceStatus]:
+    """Checks both stages, reading only: receiver, then sample."""
+    st = cfg.stages
+    return [
+        probe_stage(RECEIVER, st.device_uri_large, True, st),
+        probe_stage(SAMPLE, st.device_uri_small, False, st),
+    ]
+
+
 def check_hardware(cfg: AppConfig) -> list[DeviceStatus]:
     """Checks both stages and the TOptica, reading only: receiver, sample,
     TOptica, in that order. The stages are checked one after the other, the
@@ -226,7 +241,7 @@ def _is_placeholder(host: str) -> bool:
 NOT_HOMED_NOTE = (
     "Not homed since the controller was switched on: its angle comes from counting steps and "
     "may not match where the arm really is. If the drawing can't be made to match the setup, "
-    "home the stages with --set-zero."
+    "home the stages with 'reflecto homing'."
 )
 
 
@@ -394,7 +409,7 @@ class WatchedAxis:
             return attr
 
         def call(*args: Any, **kwargs: Any) -> Any:
-            if name == "command_homezero":
+            if name in ("command_homezero", "command_home"):
                 self._set(homing=True, moving=True)
             try:
                 result = attr(*args, **kwargs)
@@ -422,15 +437,17 @@ class WatchedAxis:
             if hasattr(result, "CurPosition") and hasattr(result, "uCurPosition"):
                 steps = result.CurPosition + result.uCurPosition / self._usteps_per_step
                 values["position"] = self._steps_to_deg * steps
+            if not values["moving"]:
+                values["homing"] = False
             self._set(**values)
         elif name == "get_position_calb":
             self._set(position=result.Position)
-        elif name == "command_homezero":
+        elif name in ("command_homezero", "command_zero"):
             self._set(position=0.0)
         elif name in ("command_move_calb", "command_movr_calb"):
             self._set(moving=True)
         elif name == "command_stop":
-            self._set(moving=False)
+            self._set(moving=False, homing=False)
 
     def snapshot(self) -> tuple[float | None, bool, bool, bool]:
         """(position, moving, error_flag, homing)"""

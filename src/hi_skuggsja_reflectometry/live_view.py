@@ -125,8 +125,8 @@ class SetupDrawing:
         # R1 ring: dotted, solid over the receiver's allowed range
         cv.create_oval(c - R, c - R, c + R, c + R, outline=_RING, dash=(2, 4), width=2)
         self._arc(R, lo, hi, outline=_RANGE, width=5)
-        hx, hy = self._xy(self._receiver_home, R + 16)
-        cv.create_text(hx, hy, text="home", fill=_RING, font=("Helvetica", 8))
+        at_home = receiver is not None and abs(receiver - self._receiver_home) < 0.05
+        self._label(self._receiver_home, R + 16, "home", fill=_RING, font=("Helvetica", 8))
 
         # planned receiver positions
         for i, planned in enumerate(plan):
@@ -171,7 +171,7 @@ class SetupDrawing:
 
         if receiver is not None:
             cv.create_line(c, c, *self._xy(receiver, R), fill=_BEAM, width=2)
-            outside = not lo - 0.01 <= receiver <= hi + 0.01
+            outside = not lo - 0.01 <= receiver <= hi + 0.01 and not at_home  # home is just past a limit by design
             colour = _BAD if outside else (_RX_MOVING if receiver_moving else _RX)
             self._box(receiver, R, 12, fill=colour, outline=colour)
             x, y = self._xy(receiver, R - 30)

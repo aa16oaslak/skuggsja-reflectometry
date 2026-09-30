@@ -70,6 +70,17 @@ class FakeAxis:
         self.calls.append(("homezero",))
         self.position = 0
 
+    def get_home_settings(self):
+        return SimpleNamespace(HomeFlags=0x1)  # homing starts towards increasing counts
+
+    def command_home(self):
+        self.calls.append(("home",))
+        self.position = 0
+
+    def command_zero(self):
+        self.calls.append(("zero",))
+        self.position = 0
+
     def close_device(self):
         self.calls.append(("close",))
 

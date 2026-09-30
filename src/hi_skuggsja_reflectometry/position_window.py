@@ -19,6 +19,17 @@ if TYPE_CHECKING:
     from .sweeps import PlannedStep
 
 _GREEN, _AMBER, _RED, _BLUE = "#2e7d32", "#9a6200", "#c62828", "#1565c0"
+DEFAULT_TURN_STEP = 5.0  # degrees
+
+
+def parse_turn_step(text: str) -> float | None:
+    """The turn step typed in the window, in degrees (a decimal comma is
+    fine), or None if it isn't a number between 0 and 360."""
+    try:
+        step = float(text.strip().replace(",", "."))
+    except ValueError:
+        return None
+    return step if 0 < step <= 360 else None
 
 
 @dataclass(frozen=True)
@@ -84,14 +95,19 @@ class PositionWindow:
         tk.Button(row, text="Mirror", width=7, command=self._mirror).pack(side="left")
         self.turns_label = tk.Label(row, anchor="w")
         self.turns_label.pack(side="left", padx=8)
-        for label, sign in (("Turn counterclockwise", 1), ("Turn clockwise", -1)):
-            row = tk.Frame(box)
-            row.pack(fill="x", pady=(6, 0))
-            tk.Label(row, text=label, width=20, anchor="w").pack(side="left")
-            for degrees in (15, 90):
-                tk.Button(
-                    row, text=f"{degrees}°", width=4, command=lambda d=sign * degrees: self._turn(d)
-                ).pack(side="left", padx=2)
+        row = tk.Frame(box)
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, text="Turn by").pack(side="left")
+        self.step_entry = tk.Entry(row, width=6, justify="right")
+        self.step_entry.insert(0, f"{DEFAULT_TURN_STEP:g}")
+        self.step_entry.pack(side="left", padx=(6, 2))
+        tk.Label(row, text="°").pack(side="left")
+        self.ccw_button = tk.Button(row, text="⟲ counterclockwise", command=lambda: self._turn_by_step(1))
+        self.ccw_button.pack(side="left", padx=(10, 2))
+        self.cw_button = tk.Button(row, text="⟳ clockwise", command=lambda: self._turn_by_step(-1))
+        self.cw_button.pack(side="left", padx=2)
+        self.direction_label = tk.Label(box, anchor="w", justify="left", font=("Helvetica", 9))
+        self.direction_label.pack(fill="x", pady=(4, 0))
         row = tk.Frame(box)
         row.pack(fill="x", pady=(8, 0))
         self.save_button = tk.Button(row, text="Save", width=7, command=self._save)
@@ -115,6 +131,7 @@ class PositionWindow:
         self.root.protocol("WM_DELETE_WINDOW", self._cancel)
         self.root.bind("<Escape>", lambda _event: self._cancel())
         self._show_save_state()
+        self._show_direction()
         self._refresh()
 
     # -- showing the arms ----------------------------------------------------------
@@ -155,6 +172,14 @@ class PositionWindow:
         self.turns_label.config(text=f"Angles grow {self.view.receiver_turns} from Tx")
         self.root.after(self.poll_ms, self._refresh)
 
+    def _show_direction(self, problem: str = "") -> None:
+        if problem:
+            self.direction_label.config(text=problem, fg=_RED)
+            return
+        self.direction_label.config(
+            text=f"Tx is drawn at {self.view.tx_direction:g}° (0 right, 90 up, 180 left, 270 down).", fg="black"
+        )
+
     # -- matching the drawing to the setup --------------------------------------
 
     def _mirror(self) -> None:
@@ -162,12 +187,20 @@ class PositionWindow:
         self._set_view(replace(self.view, receiver_turns=turns))
 
     def _turn(self, degrees: float) -> None:
-        self._set_view(replace(self.view, tx_direction=self.view.tx_direction + degrees))
+        self._set_view(replace(self.view, tx_direction=(self.view.tx_direction + degrees) % 360))
+
+    def _turn_by_step(self, sign: int) -> None:
+        step = parse_turn_step(self.step_entry.get())
+        if step is None:
+            self._show_direction("Type the turn in degrees, more than 0 and at most 360, e.g. 2.5.")
+            return
+        self._turn(sign * step)
 
     def _set_view(self, view: ViewConfig) -> None:
         self.view = view
         self.drawing.view = view
         self._show_save_state()
+        self._show_direction()
 
     def _show_save_state(self) -> None:
         if self.view == self._saved_view:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
 from . import clock
 from .config import StageConfig
@@ -18,6 +19,12 @@ MVCMD_RUNNING = 0x80  # MvcmdStatus.MVCMD_RUNNING
 BORDER_IS_ENCODER = 0x01  # borders are the LeftBorder/RightBorder positions, not limit switches
 BORDER_STOP_LEFT = 0x02
 BORDER_STOP_RIGHT = 0x04
+STATE_IS_HOMED = 0x20  # StateFlags: homed since the controller was switched on
+HOME_DIR_FIRST = 0x01  # HomeFlags: homing starts towards increasing counts ("right") if set
+
+RECEIVER, SAMPLE = "receiver", "sample"
+STAGE_LABELS = {RECEIVER: "Receiver R1", SAMPLE: "Sample R2"}
+HOMING_ORDER = (SAMPLE, RECEIVER)  # the sample first, as the sweeps' --set-zero always did
 
 
 class HardwareUnavailable(RuntimeError):
@@ -140,103 +147,76 @@ def position(axis: ximc.Axis, large: bool, zero_l: float, zero_s: float) -> floa
         return int(axis.get_position_calb().Position) - zero_s
 
 
-def confirm_path_clear(min_deg: float, max_deg: float, home_large: float, home_small: float) -> bool:
-    """Blocks until the user explicitly confirms the path is clear.
-
-    Returns True only on exact match to the confirmation phrase -- this
-    avoids accidental Enter-presses confirming a dangerous move.
-    """
-    print("\n" + "=" * 60)
-    print("⚠️WARNING")
-    print("=" * 60)
-    print(f"To reset zero position the stages must return to home ({home_large}° and {home_small}°),")
-    print(f"OUTSIDE operating boundaries ({min_deg}° to {max_deg}°).")
-    print("This range is not guaranteed to be clear of obstacles.")
-    print()
-    print("Before continuing:")
-    print("  1. Check the full rotation path is clear of cables,")
-    print("     mounts, or anything that could collide with the stage.")
-    print("  2. Make sure no measurement equipment is in the way.")
-    print("=" * 60)
-
+def homing_direction(axis: Any) -> int | None:
+    """Which way the controller's own homing starts: +1 towards increasing
+    counts, -1 towards decreasing, None if its settings can't be read."""
     try:
-        response = input(
-            "\nType 'clear' to confirm the path is clear and proceed, "
-            "or anything else to cancel: "
-        ).strip().lower()
-    except EOFError:  # stdin closed, or Ctrl+C interrupted the read
-        response = ""
-
-    if response == "clear":
-        print("✅ Confirmed — proceeding with homing.\n")
-        return True
-    else:
-        print("❌ Homing cancelled.\n")
-        return False
+        flags = int(axis.get_home_settings().HomeFlags)
+    except Exception:  # noqa: BLE001 -- only shown to the person, before they confirm
+        return None
+    return 1 if flags & HOME_DIR_FIRST else -1
 
 
-def home_and_zero(
-    axis1: ximc.Axis,
-    axis2: ximc.Axis,
-    name1: str,
-    name2: str,
-    min_deg: float,
-    max_deg: float,
-    res: float,
-    zero_l: float,
-    zero_s: float,
+def home_stage(axis: Any, stage: str, cfg: StageConfig, stop_event: threading.Event, poll_ms: int = 100) -> None:
+    """Drives one stage to its home sensor with the controller's own homing
+    procedure (its direction and speeds are set in the controller), and
+    only when the controller reports it homed, sets its count to 0 there.
+
+    For the receiver, stopping at the soft limits is switched off while it
+    homes: the limits are counted from a zero that is only right once it is
+    homed. They are set again, now in the right place, straight after.
+
+    Raises RuntimeError if a stop interrupts it or the controller does not
+    report the stage homed; the count is then left alone, not zeroed."""
+    label = STAGE_LABELS[stage]
+    if stop_event.is_set():
+        raise RuntimeError(f"[{label}] emergency stop before homing")
+
+    edges, original_flags = None, None
+    if stage == RECEIVER:
+        edges = axis.get_edges_settings()
+        original_flags = int(edges.BorderFlags)
+        edges.BorderFlags = original_flags & ~(BORDER_STOP_LEFT | BORDER_STOP_RIGHT)
+        axis.set_edges_settings(edges)
+
+    homed = False
+    try:
+        print(f"  [{label}] homing...")
+        axis.command_home()
+        try:
+            wait_for_stop(axis, stop_event, poll_ms)
+        except RuntimeError:
+            raise RuntimeError(f"[{label}] homing was stopped before it finished; not homed") from None
+        status = axis.get_status()
+        if int(status.MvCmdSts) & MVCMD_ERROR or not int(getattr(status, "Flags", 0)) & STATE_IS_HOMED:
+            raise RuntimeError(f"[{label}] the controller did not report the stage homed; its count was left alone")
+        axis.command_zero()
+        homed = True
+    finally:
+        if edges is not None:
+            if homed:
+                set_boundaries(axis, cfg.res_large, cfg.angle_min, cfg.angle_max, cfg.zero_l)
+            else:
+                edges.BorderFlags = original_flags
+                axis.set_edges_settings(edges)
+    home_angle = cfg.zero_l if stage == RECEIVER else -cfg.zero_s
+    print(f"  [{label}] homed ✓ (count 0 = {home_angle:g}° in the settings)")
+
+
+def home_stages(
+    large_stage: Any,
+    small_stage: Any,
+    stages: Sequence[str],
+    cfg: StageConfig,
+    on_homed: Callable[[str], None],
     stop_event: threading.Event,
 ) -> None:
-    """Moves both stages to home and sets zero there.
-
-    Requires explicit user confirmation since the home position may be
-    outside the normal safe bounds. A stop between or during the homing
-    moves aborts the rest of the procedure.
-    """
-    if stop_event.is_set():
-        raise RuntimeError("Emergency stop before homing")
-
-    print(f"  [{name2}] Moving to home position ({zero_s}°)...")
-
-    axis2.command_homezero()
-
-    if stop_event.is_set():
-        raise RuntimeError(f"[{name2}] Emergency stop during homing -- its zero may be wrong, re-run --set-zero")
-
-    print(f"  [{name2}] Homed and zeroed ✓")
-
-    if not confirm_path_clear(min_deg, max_deg, zero_l, -zero_s):
-        raise RuntimeError(f"[{name1}] Homing aborted by user — coast not confirmed clear")
-
-    if stop_event.is_set():
-        raise RuntimeError(f"[{name1}] Emergency stop before homing")
-
-    print(f"  [{name1}] Moving to home position ({-zero_l}°)...")
-
-    # Temporarily widen soft limits to allow reaching home, if home is outside them
-    edges = axis1.get_edges_settings()
-    original_left, original_right = edges.LeftBorder, edges.RightBorder
-
-    home_steps = degrees_to_microsteps(res, -zero_l)
-    if home_steps < original_left or home_steps > original_right:
-        # widen just enough to fit home position, with a little margin
-        margin = degrees_to_microsteps(res, 5.0)
-        edges.LeftBorder = min(original_left, home_steps - margin)
-        edges.RightBorder = max(original_right, home_steps + margin)
-        axis1.set_edges_settings(edges)
-        print(f"  [{name1}] Temporarily widened limits to reach home")
-
-    try:
-        axis1.command_homezero()
-        if stop_event.is_set():
-            raise RuntimeError(f"[{name1}] Emergency stop during homing -- its zero may be wrong, re-run --set-zero")
-        print(f"  [{name1}] Homed and zeroed ✓")
-    finally:
-        # Always restore original limits, even if move failed
-        edges.LeftBorder = original_left
-        edges.RightBorder = original_right
-        axis1.set_edges_settings(edges)
-        print(f"  [{name1}] Restored normal safe limits")
+    """Homes the given stages (RECEIVER, SAMPLE) one after the other, the
+    sample first; calls on_homed(stage) after each. Ask the person to
+    confirm the path is clear before calling this: nothing here asks."""
+    for stage in (s for s in HOMING_ORDER if s in stages):
+        home_stage(large_stage if stage == RECEIVER else small_stage, stage, cfg, stop_event)
+        on_homed(stage)
 
 
 def set_boundaries(axis: ximc.Axis, res: float, angle_min: float, angle_max: float, zero_l: float) -> None:

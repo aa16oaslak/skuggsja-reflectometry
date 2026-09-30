@@ -126,84 +126,117 @@ def test_set_boundaries_computes_edges_from_zero_l():
     assert axis.edges.RightBorder == stages.degrees_to_microsteps(0.0072, ZERO_L - ANGLE_MIN)
 
 
-def test_confirm_path_clear_requires_exact_confirmation(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda _prompt: "clear")
-    assert stages.confirm_path_clear(30, 180, ZERO_L, -ZERO_S) is True
+def stage_cfg():
+    from hi_skuggsja_reflectometry.config import StageConfig
 
-    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
-    assert stages.confirm_path_clear(30, 180, ZERO_L, -ZERO_S) is False
-
-
-def test_home_and_zero_cancelled_stops_before_moving_axis1(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
-    axis1, axis2 = FakeAxis(), FakeAxis()
-
-    with pytest.raises(RuntimeError):
-        stages.home_and_zero(axis1, axis2, "large", "small", ANGLE_MIN, ANGLE_MAX, 0.0072, ZERO_L, ZERO_S, threading.Event())
-
-    assert ("homezero",) in axis2.calls  # small stage already homed
-    assert axis1.calls == []  # large stage never touched
+    return StageConfig(
+        device_uri_large="COM3", device_uri_small="COM4", zero_l=ZERO_L, zero_s=ZERO_S,
+        res_large=0.0072, res_small=0.015, angle_min=ANGLE_MIN, angle_max=ANGLE_MAX,
+    )
 
 
-def test_home_and_zero_confirmed_homes_both_and_restores_edges(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda _prompt: "clear")
-    axis1, axis2 = FakeAxis(), FakeAxis()
-    original_left, original_right = axis1.edges.LeftBorder, axis1.edges.RightBorder
+class RecordingAxis(FakeAxis):
+    """Notes whether stopping at the soft limits was on when homing started."""
 
-    stages.home_and_zero(axis1, axis2, "large", "small", ANGLE_MIN, ANGLE_MAX, 0.0072, ZERO_L, ZERO_S, threading.Event())
-
-    assert ("homezero",) in axis1.calls
-    assert ("homezero",) in axis2.calls
-    assert axis1.edges.LeftBorder == original_left
-    assert axis1.edges.RightBorder == original_right
+    def command_home(self):
+        self.border_flags_while_homing = int(self.edges.BorderFlags)
+        super().command_home()
 
 
-def test_home_and_zero_does_nothing_if_already_stopped(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda _prompt: pytest.fail("should not prompt"))
-    axis1, axis2 = FakeAxis(), FakeAxis()
+def test_home_stage_homes_with_limits_off_then_zeroes_and_sets_the_limits():
+    axis = RecordingAxis(position=150.49)
+    axis.edges.BorderFlags = 0x07  # stop at both soft limits, as a sweep leaves it
+
+    stages.home_stage(axis, stages.RECEIVER, stage_cfg(), threading.Event())
+
+    kinds = [call[0] for call in axis.calls]
+    assert kinds.index("home") < kinds.index("zero")
+    assert axis.border_flags_while_homing & (stages.BORDER_STOP_LEFT | stages.BORDER_STOP_RIGHT) == 0
+    assert int(axis.edges.BorderFlags) == 0x07  # the limits are back on, now counted from home
+    assert axis.edges.LeftBorder == stages.degrees_to_microsteps(0.0072, ZERO_L - ANGLE_MAX)
+
+
+def test_home_stage_leaves_the_sample_limits_alone():
+    axis = FakeAxis(position=17.59)
+    before = axis.edges
+
+    stages.home_stage(axis, stages.SAMPLE, stage_cfg(), threading.Event())
+
+    assert [call[0] for call in axis.calls] == ["home", "zero"]
+    assert axis.edges is before
+
+
+def test_home_stage_does_nothing_if_already_stopped():
+    axis = FakeAxis()
     stop_event = threading.Event()
     stop_event.set()
 
-    with pytest.raises(RuntimeError, match="Emergency stop"):
-        stages.home_and_zero(axis1, axis2, "large", "small", ANGLE_MIN, ANGLE_MAX, 0.0072, ZERO_L, ZERO_S, stop_event)
+    with pytest.raises(RuntimeError, match="emergency stop before homing"):
+        stages.home_stage(axis, stages.RECEIVER, stage_cfg(), stop_event)
 
-    assert axis1.calls == axis2.calls == []
-
-
-def test_home_and_zero_stop_during_first_homing_skips_prompt_and_second_stage(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda _prompt: pytest.fail("should not prompt"))
-    axis1, axis2 = FakeAxis(), FakeAxis()
-    stop_event = threading.Event()
-    axis2.command_homezero = stop_event.set  # STOP pressed while the small stage homes
-
-    with pytest.raises(RuntimeError, match="zero may be wrong"):
-        stages.home_and_zero(axis1, axis2, "large", "small", ANGLE_MIN, ANGLE_MAX, 0.0072, ZERO_L, ZERO_S, stop_event)
-
-    assert axis1.calls == []
+    assert axis.calls == []
 
 
-def test_home_and_zero_stop_pressed_at_prompt_still_blocks_second_homing(monkeypatch):
+def test_home_stage_stopped_midway_is_not_zeroed_and_the_limits_are_restored():
     stop_event = threading.Event()
 
-    def type_clear_after_pressing_stop(_prompt):
-        stop_event.set()
-        return "clear"
+    class StoppedWhileHoming(FakeAxis):
+        def command_home(self):
+            super().command_home()
+            stop_event.set()  # STOP pressed while it travels
 
-    monkeypatch.setattr("builtins.input", type_clear_after_pressing_stop)
-    axis1, axis2 = FakeAxis(), FakeAxis()
+    axis = StoppedWhileHoming(position=150.49)
+    axis.edges.BorderFlags = 0x07
 
-    with pytest.raises(RuntimeError, match="Emergency stop"):
-        stages.home_and_zero(axis1, axis2, "large", "small", ANGLE_MIN, ANGLE_MAX, 0.0072, ZERO_L, ZERO_S, stop_event)
+    with pytest.raises(RuntimeError, match="stopped before it finished; not homed"):
+        stages.home_stage(axis, stages.RECEIVER, stage_cfg(), stop_event)
 
-    assert ("homezero",) not in axis1.calls
+    assert ("zero",) not in axis.calls and ("stop",) in axis.calls
+    assert int(axis.edges.BorderFlags) == 0x07
 
 
-def test_confirm_path_clear_treats_closed_input_as_cancel(monkeypatch):
-    def closed(_prompt):
-        raise EOFError
+def test_home_stage_does_not_zero_if_the_controller_does_not_report_homed():
+    class NeverHomed(FakeAxis):
+        def get_status(self):
+            status = super().get_status()
+            status.Flags = 0
+            return status
 
-    monkeypatch.setattr("builtins.input", closed)
-    assert stages.confirm_path_clear(30, 180, ZERO_L, -ZERO_S) is False
+    axis = NeverHomed(position=150.49)
+    axis.edges.BorderFlags = 0x07
+
+    with pytest.raises(RuntimeError, match="did not report the stage homed"):
+        stages.home_stage(axis, stages.RECEIVER, stage_cfg(), threading.Event())
+
+    assert ("zero",) not in axis.calls
+    assert int(axis.edges.BorderFlags) == 0x07
+
+
+@pytest.mark.parametrize(
+    "which, order",
+    [
+        ((stages.RECEIVER, stages.SAMPLE), [stages.SAMPLE, stages.RECEIVER]),  # the sample always first
+        ((stages.RECEIVER,), [stages.RECEIVER]),
+        ((stages.SAMPLE,), [stages.SAMPLE]),
+    ],
+)
+def test_home_stages_homes_only_what_was_asked_sample_first(which, order):
+    large, small = FakeAxis(position=150.49), FakeAxis(position=17.59)
+    homed = []
+
+    stages.home_stages(large, small, which, stage_cfg(), homed.append, threading.Event())
+
+    assert homed == order
+    assert (("home",) in large.calls) == (stages.RECEIVER in which)
+    assert (("home",) in small.calls) == (stages.SAMPLE in which)
+
+
+def test_homing_direction_is_read_from_the_home_settings():
+    axis = FakeAxis()
+    assert stages.homing_direction(axis) == 1
+
+    axis.get_home_settings = lambda: (_ for _ in ()).throw(RuntimeError("no"))
+    assert stages.homing_direction(axis) is None
 
 
 def test_open_stages_calibrates_and_sets_boundaries(monkeypatch):

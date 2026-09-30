@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from .config import AppConfig
-from .stages import home_and_zero, position, rotate_relative, rotate_to_angle
+from .stages import HOMING_ORDER, home_stages, position, rotate_relative, rotate_to_angle
 from .toptica import build_output_filename, scan
 
 if TYPE_CHECKING:
@@ -112,10 +112,15 @@ def sweep_nonspec(
     _check_outputs_available(filename, start, step, amount, freq_start, freq_stop, int_time, overwrite)
 
     if setzero:
-        home_and_zero(
-            large_stage, small_stage, STAGE_NAMES[0], STAGE_NAMES[1],
-            angle_min, angle_max, cfg.stages.res_large, zero_l, zero_s, stop_event,
-        )
+        # the person confirmed the path is clear before the sweep started
+        home_stages(large_stage, small_stage, HOMING_ORDER, cfg.stages, lambda _stage: None, stop_event)
+        if stop_event.is_set():
+            return
+        print(f"Rotating sample to {NONSPEC_SAMPLE_ANGLE}°")
+        rotate_to_angle(small_stage, NONSPEC_SAMPLE_ANGLE, False, stop_event, zero_l, zero_s, angle_min, angle_max)
+        if stop_event.is_set():
+            return
+        print(f"Rotated sample to {position(small_stage, False, zero_l, zero_s)}°")
     else:
         print("Rotating receiver to 30°")
         print(f"Rotating sample to {NONSPEC_SAMPLE_ANGLE}°")
@@ -186,10 +191,8 @@ def sweep_spec(
     _check_outputs_available(filename, start, step, amount, freq_start, freq_stop, int_time, overwrite)
 
     if setzero:
-        home_and_zero(
-            large_stage, small_stage, STAGE_NAMES[0], STAGE_NAMES[1],
-            angle_min, angle_max, cfg.stages.res_large, zero_l, zero_s, stop_event,
-        )
+        # the person confirmed the path is clear before the sweep started
+        home_stages(large_stage, small_stage, HOMING_ORDER, cfg.stages, lambda _stage: None, stop_event)
     else:
         print("Rotating receiver to 30°")
         print("Rotating sample to 0°")
