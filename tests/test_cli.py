@@ -563,15 +563,62 @@ def test_set_zero_asks_before_the_real_sweep_moves_anything(tmp_path, monkeypatc
     assert len(real_runs) == 1
 
 
-def test_swapped_ports_stop_a_command_before_anything_moves(tmp_path, monkeypatch):
+@pytest.fixture
+def lab_controllers(tmp_path, monkeypatch):
+    """The lab PC: the sample's controller (33807) on COM3, the ring's (16158)
+    on COM4 -- the other way round from the ports in the default settings --
+    with both serials pinned."""
     import libximc.highlevel as real_ximc
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "reflecto.toml").write_text("[stages]\nserial_large = 16158\nserial_small = 33807\n")
-    by_port = {"COM3": FakeAxis(serial=33807), "COM4": FakeAxis(serial=16158)}
-    monkeypatch.setattr(real_ximc, "Axis", lambda uri: by_port[uri.rsplit("\\", 1)[-1]])
+    by_port = {"COM3": FakeAxis(position=100.0, serial=33807), "COM4": FakeAxis(position=100.0, serial=16158)}
+    monkeypatch.setattr(real_ximc, "Axis", lambda uri: by_port[uri.replace("\\", "/").rsplit("/", 1)[-1]])
+    listing = [{"uri": f"xi-com:\\\\.\\{port}", "device_serial": axis.serial} for port, axis in by_port.items()]
+    monkeypatch.setattr(real_ximc, "enumerate_devices", lambda flags, hints="addr=": listing)
+    return by_port
+
+
+def test_pinned_serials_find_each_controller_whatever_its_port(lab_controllers):
+    result = runner.invoke(cli.app, ["position", "--no-gui"])
+
+    assert result.exit_code == 0, result.output
+    assert "Receiver R1: its controller (16158) is on COM4, not COM3 as written in the settings; using COM4." in result.output
+    assert "Sample R2: its controller (33807) is on COM3, not COM4" in result.output
+
+
+def test_homing_the_sample_homes_the_sample_controller_wherever_it_is(lab_controllers, stages_ok):
+    result = runner.invoke(cli.app, ["homing", "--no-gui", "--stage", "sample"], input="clear\n")
+
+    assert result.exit_code == 0, result.output
+    assert ("home",) in lab_controllers["COM3"].calls  # 33807, the sample's
+    assert ("home",) not in lab_controllers["COM4"].calls
+
+
+def test_a_pinned_controller_that_is_not_connected_stops_the_command(lab_controllers, monkeypatch):
+    import libximc.highlevel as real_ximc
+
+    monkeypatch.setattr(
+        real_ximc, "enumerate_devices", lambda flags, hints="addr=": [{"uri": "xi-com:\\\\.\\COM3", "device_serial": 33807}]
+    )
 
     result = runner.invoke(cli.app, ["position", "--no-gui"])
 
     assert result.exit_code == 1
+    assert "Could not find the receiver's controller (16158) on any port" in result.output
+    assert "33807 on COM3" in result.output
+
+
+def test_if_the_ports_cannot_be_listed_a_wrong_port_is_still_refused(lab_controllers, monkeypatch):
+    import libximc.highlevel as real_ximc
+
+    def cannot_list(flags, hints="addr="):
+        raise RuntimeError("enumeration failed")
+
+    monkeypatch.setattr(real_ximc, "enumerate_devices", cannot_list)
+
+    result = runner.invoke(cli.app, ["position", "--no-gui"])
+
+    assert result.exit_code == 1
+    assert "Could not list the connected controllers" in result.output
     assert "the two ports are swapped" in result.output and "Nothing was moved" in result.output

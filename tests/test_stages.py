@@ -421,3 +421,19 @@ def test_open_stages_goes_ahead_with_the_right_controllers(monkeypatch):
 
     assert (large.serial, small.serial) == (16158, 33807)
     assert large.calibration == (0.0072, 9)
+
+
+def test_locate_controllers_changes_nothing_without_pinned_serials(monkeypatch):
+    monkeypatch.setattr(real_ximc, "enumerate_devices", lambda *a: pytest.fail("listed the ports"))
+    cfg = stage_cfg()
+    assert stages.locate_controllers(cfg) == (cfg, [])
+
+
+def test_locate_controllers_uses_the_port_each_pinned_controller_is_on(monkeypatch):
+    listing = [{"uri": "xi-com:\\\\.\\COM4", "device_serial": 16158}, {"uri": "xi-com:\\\\.\\COM3", "device_serial": 33807}]
+    monkeypatch.setattr(real_ximc, "enumerate_devices", lambda *a: listing)
+
+    located, notes = stages.locate_controllers(pinned())
+
+    assert (located.device_uri_large, located.device_uri_small) == ("xi-com:\\\\.\\COM4", "xi-com:\\\\.\\COM3")
+    assert len(notes) == 2 and "using COM4" in notes[0]

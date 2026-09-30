@@ -15,7 +15,7 @@ from .arm_mover import MAX_STEP
 from .config import ConfigError, ViewConfig, save_view
 from .hardware import NOT_HOMED_NOTE, ArmReading, PositionReader, arm_angle
 from .live_view import SetupDrawing
-from .stages import RECEIVER, SAMPLE, STAGE_LABELS
+from .stages import RECEIVER, SAMPLE, STAGE_LABELS, port_name
 from .stop_window import open_root
 
 if TYPE_CHECKING:
@@ -76,6 +76,10 @@ class PositionWindow:
         tk, self.root = open_root("the position window", "Rerun with --no-gui to answer in the terminal instead.")
         self.tk = tk
         self._reader, self._stages, self._file = reader, cfg.stages, settings_file
+        self._ports = {
+            RECEIVER: "simulated" if simulated else port_name(cfg.stages.device_uri_large),
+            SAMPLE: "simulated" if simulated else port_name(cfg.stages.device_uri_small),
+        }
         self._mover, self._simulated = mover, simulated
         self._plan = list(plan)
         self.view = self._saved_view = cfg.view
@@ -161,13 +165,16 @@ class PositionWindow:
         self.drawing.draw(sample, receiver, self._plan, -1, receiver_moving=bool(readings[0] and readings[0].moving))
 
         lines = []
-        for name, reading, angle in (("Receiver R1", readings[0], receiver), ("Sample R2", readings[1], sample)):
+        for name, reading, angle, port in (
+            ("Receiver R1", readings[0], receiver, self._ports[RECEIVER]),
+            ("Sample R2", readings[1], sample, self._ports[SAMPLE]),
+        ):
             if reading is None:
-                lines.append(f"{name:<13}not read")
+                lines.append(f"{name:<13}not read ({port})")
                 continue
             state = "homed" if reading.homed else "NOT HOMED"
             lines.append(f"{name:<13}{angle:8.2f}°  {state}{', moving' if reading.moving else ''}")
-            lines.append(f"{'':<13}controller at {reading.position:.2f}°")
+            lines.append(f"{'':<13}controller on {port} at {reading.position:.2f}°")
         if receiver is not None and sample is not None:
             phi1, phi2 = geometry.phi_angles(sample, receiver)
             lines.append(f"φ1 incidence {phi1:8.2f}°")
@@ -237,7 +244,7 @@ class PositionWindow:
         for stage in (RECEIVER, SAMPLE):
             row = tk.Frame(box)
             row.pack(fill="x", pady=(6, 0))
-            tk.Label(row, text=STAGE_LABELS[stage], width=11, anchor="w").pack(side="left")
+            tk.Label(row, text=f"{STAGE_LABELS[stage]} ({self._ports[stage]})", width=19, anchor="w").pack(side="left")
             ccw = tk.Button(row, text="⟲ counterclockwise", command=lambda s=stage: self._move(s, True))
             cw = tk.Button(row, text="⟳ clockwise", command=lambda s=stage: self._move(s, False))
             ccw.pack(side="left", padx=2)

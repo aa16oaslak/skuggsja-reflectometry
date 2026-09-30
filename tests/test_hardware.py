@@ -328,7 +328,7 @@ def test_check_suggests_pinning_until_it_is_done(cfg, monkeypatch):
     unpinned = hardware.probe_stage(hardware.RECEIVER, cfg.stages.device_uri_large, True, cfg.stages)
     pinned = hardware.probe_stage(hardware.RECEIVER, cfg.stages.device_uri_large, True, pin(cfg))
 
-    assert unpinned.state == OK and any("set serial_large" in d for d in unpinned.details)
+    assert unpinned.state == OK and any("Set serial_large = 16158" in d for d in unpinned.details)
     assert "Serial number 16158" in unpinned.details
     assert pinned.state == OK and not any("serial_large" in d for d in pinned.details)
 

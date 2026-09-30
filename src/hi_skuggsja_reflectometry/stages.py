@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from . import clock
@@ -329,6 +330,46 @@ def serial_problem(axis: Any, large: bool, cfg: StageConfig) -> str | None:
         f"it has controller {actual}, but the {role}'s is {expected} (serial_{'large' if large else 'small'} in "
         "the settings). Check which port each controller is on"
     )
+
+
+def locate_controllers(cfg: StageConfig) -> tuple[StageConfig, list[str]]:
+    """With the controllers' serial numbers pinned in the settings, finds
+    which port each is on now -- Windows numbers COM ports per PC and per
+    USB socket -- and returns the settings with those ports, plus a note
+    for each that differs from the ports written in the settings. Without
+    pinned serials it changes nothing. Raises HardwareUnavailable if a
+    pinned controller is on no port."""
+    wanted = {RECEIVER: cfg.serial_large, SAMPLE: cfg.serial_small}
+    if not any(wanted.values()):
+        return cfg, []
+    ximc = _load_ximc()
+    try:
+        devices = ximc.enumerate_devices(ximc.EnumerateFlags.ENUMERATE_PROBE)
+        found = {int(d["device_serial"]): d["uri"] for d in devices}
+    except Exception as e:  # noqa: BLE001 -- the ports in the settings are still checked when opened
+        return cfg, [f"Could not list the connected controllers ({e}); using the ports in the settings."]
+    uris = {RECEIVER: cfg.device_uri_large, SAMPLE: cfg.device_uri_small}
+    notes, missing = [], []
+    for role, serial in wanted.items():
+        if not serial:
+            continue
+        uri = found.get(serial)
+        if uri is None:
+            missing.append(f"the {role}'s controller ({serial})")
+            continue
+        if port_name(uri) != port_name(uris[role]):
+            notes.append(
+                f"{STAGE_LABELS[role]}: its controller ({serial}) is on {port_name(uri)}, not "
+                f"{port_name(uris[role])} as written in the settings; using {port_name(uri)}."
+            )
+        uris[role] = uri
+    if missing:
+        listing = ", ".join(f"{s} on {port_name(u)}" for s, u in found.items()) or "none"
+        raise HardwareUnavailable(
+            f"Could not find {' or '.join(missing)} on any port. Connected controllers: {listing}. Check the "
+            "USB cables and power, and that no other program (such as XILab) has a controller open."
+        )
+    return replace(cfg, device_uri_large=uris[RECEIVER], device_uri_small=uris[SAMPLE]), notes
 
 
 def verify_controllers(large_stage: Any, small_stage: Any, cfg: StageConfig) -> None:

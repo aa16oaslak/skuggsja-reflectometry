@@ -130,8 +130,9 @@ def probe_stage(name: str, uri: str, large: bool, cfg: StageConfig) -> DeviceSta
         if not (cfg.serial_large if large else cfg.serial_small):
             key = "serial_large" if large else "serial_small"
             hint = (
-                f"To catch swapped ports, set {key} to this port's serial number under [stages] in "
-                "reflecto.toml, once you're sure this is the right controller."
+                f"Set {key} = {axis.get_serial_number()} under [stages] in reflecto.toml once you're sure this "
+                "is the right controller: the program then finds it on whatever port it is, and never mixes "
+                "the two stages up."
             )
             status = replace(status, details=[*status.details, hint])
         return status

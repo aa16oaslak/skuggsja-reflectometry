@@ -28,6 +28,7 @@ from .stages import (
     describe_homing,
     home_stages,
     homing_direction,
+    locate_controllers,
     open_stages,
     port_name,
 )
@@ -93,6 +94,19 @@ def _load_config(path: Path | None) -> cfgmod.AppConfig:
         raise typer.Exit(code=1) from None
 
 
+def _locate(cfg: cfgmod.AppConfig) -> cfgmod.AppConfig:
+    """The settings with each stage's port found from its pinned serial
+    number (see stages.locate_controllers); exits if one is not connected."""
+    try:
+        stage_cfg, notes = locate_controllers(cfg.stages)
+    except HardwareUnavailable as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(code=1) from None
+    for note in notes:
+        typer.echo(note)
+    return replace(cfg, stages=stage_cfg)
+
+
 def _ask(prompt: str) -> str:
     try:
         return input(prompt).strip().lower()
@@ -108,6 +122,8 @@ def check(
 ) -> None:
     """Check that both stages and the TOptica are connected and ready. Reads status only: nothing moves."""
     cfg = _load_config(config)
+    if not simulate:
+        cfg = _locate(cfg)
     rig = simulation.SimRig(cfg) if simulate else None
     try:
         run_check = (lambda: hardware.check_simulated(rig)) if rig else (lambda: hardware.check_hardware(cfg))
@@ -180,6 +196,8 @@ def position(
     to match the table, and saved. After ticking "Allow moves", buttons turn the real arms a few
     degrees at a time, to calibrate; nothing moves before that."""
     cfg = _load_config(config)
+    if not simulate:
+        cfg = _locate(cfg)
     with _readable_stages(cfg, simulate) as axes:
         reader = hardware.PositionReader(*axes).start()
         mover = ArmMover(*axes, cfg.stages)
@@ -270,6 +288,8 @@ def homing(
     right again (after the controllers were switched on, for example). Asks you to confirm the path
     is clear before anything moves, and shows where the arms are afterwards."""
     cfg = _load_config(config)
+    if not simulate:
+        cfg = _locate(cfg)
     to_home = list(HOMING_ORDER) if stage is HomeStages.both else [stage.value]
     rig = None
     if simulate:
@@ -504,6 +524,8 @@ def _run(
     if simulate:
         _simulate(sweep_fn, plan, title, cfg, sweep_args, gui, speed, skip_check)
         return
+
+    cfg = _locate(cfg)
 
     checked = _preflight(lambda: hardware.check_hardware(cfg), cfg, skip_check, simulated=False)
 
